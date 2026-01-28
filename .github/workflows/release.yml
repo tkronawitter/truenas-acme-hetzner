@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - run: |
+          mkdir -p release
+          go build -tags "netgo,osusergo" -ldflags "-s -w" -o release/tah-linux-amd64 .
+      - run: |
+          cd release
+          sha256sum tah-linux-amd64 > checksums-sha256.txt
+          sha512sum tah-linux-amd64 > checksums-sha512.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/tah-linux-amd64
+            release/checksums-sha256.txt
+            release/checksums-sha512.txt
+          generate_release_notes: true
