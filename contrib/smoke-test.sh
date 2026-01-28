@@ -1,6 +1,6 @@
 #!/bin/bash
-# Release testing script for truenas-acme-hetzner
-# Usage: ./test-release.sh <domain> [tah-binary-path]
+# Smoke test for truenas-acme-hetzner
+# Usage: ./smoke-test.sh <domain> [tah-binary-path]
 #
 # Prerequisites:
 # - Valid Hetzner Cloud API token in ~/.tahtoken
@@ -23,8 +23,37 @@ pass() { echo -e "${GREEN}✓ PASS${NC}: $1"; }
 fail() { echo -e "${RED}✗ FAIL${NC}: $1"; exit 1; }
 info() { echo -e "${YELLOW}→${NC} $1"; }
 
+# DNS lookup with retry for propagation
+dns_lookup_retry() {
+    local record="$1"
+    local expect_empty="$2"
+    local max_attempts=6
+    local wait_secs=5
+
+    for ((i=1; i<=max_attempts; i++)); do
+        DNS_RESULT=$(dig +short TXT "$record" @hydrogen.ns.hetzner.com 2>/dev/null || true)
+
+        if [[ "$expect_empty" == "true" ]]; then
+            if [[ -z "$DNS_RESULT" ]]; then
+                return 0
+            fi
+        else
+            if [[ -n "$DNS_RESULT" ]]; then
+                echo "$DNS_RESULT"
+                return 0
+            fi
+        fi
+
+        if [[ $i -lt $max_attempts ]]; then
+            echo -e "  ${YELLOW}...${NC} waiting ${wait_secs}s for propagation (attempt $i/$max_attempts)"
+            sleep $wait_secs
+        fi
+    done
+    return 1
+}
+
 echo "========================================"
-echo "truenas-acme-hetzner Release Test Suite"
+echo "truenas-acme-hetzner Smoke Test"
 echo "========================================"
 echo "Domain: $DOMAIN"
 echo "Binary: $TAH"
@@ -75,13 +104,11 @@ fi
 
 # Test 4b: Verify record exists (optional, requires dig)
 if command -v dig &> /dev/null; then
-    info "Test 4b: Verifying record via DNS lookup (may take a moment)..."
-    sleep 2
-    DNS_RESULT=$(dig +short TXT "$TEST_NAME.$DOMAIN" @ns1.hetzner.cloud 2>/dev/null || true)
-    if [[ -n "$DNS_RESULT" ]]; then
-        pass "DNS lookup confirmed record exists: $DNS_RESULT"
+    info "Test 4b: Verifying record via DNS lookup..."
+    if RESULT=$(dns_lookup_retry "$TEST_NAME.$DOMAIN" "false"); then
+        pass "DNS lookup confirmed record exists: $RESULT"
     else
-        echo -e "${YELLOW}  WARN${NC}: DNS lookup returned empty (propagation delay or lookup issue)"
+        fail "DNS lookup failed - record not found after retries"
     fi
 else
     echo -e "${YELLOW}  SKIP${NC}: dig not available, skipping DNS verification"
@@ -98,12 +125,10 @@ fi
 # Test 5b: Verify record removed (optional)
 if command -v dig &> /dev/null; then
     info "Test 5b: Verifying record removed via DNS lookup..."
-    sleep 2
-    DNS_RESULT=$(dig +short TXT "$TEST_NAME.$DOMAIN" @ns1.hetzner.cloud 2>/dev/null || true)
-    if [[ -z "$DNS_RESULT" ]]; then
+    if dns_lookup_retry "$TEST_NAME.$DOMAIN" "true"; then
         pass "DNS lookup confirmed record removed"
     else
-        echo -e "${YELLOW}  WARN${NC}: Record may still exist (propagation delay): $DNS_RESULT"
+        echo -e "${YELLOW}  WARN${NC}: Record may still exist (propagation delay)"
     fi
 fi
 
@@ -125,8 +150,3 @@ echo ""
 echo "========================================"
 echo -e "${GREEN}All tests passed!${NC}"
 echo "========================================"
-echo ""
-echo "Ready for release. Next steps:"
-echo "  1. Merge PR to main"
-echo "  2. Tag final release: git tag v1.1.0"
-echo "  3. Push: git push origin main --tags"
