@@ -19,6 +19,7 @@ jobs:
       - run: go test -v -race -coverprofile=coverage.out ./...
       - uses: codecov/codecov-action@v5
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.out
           fail_ci_if_error: false
       - run: go vet ./...
