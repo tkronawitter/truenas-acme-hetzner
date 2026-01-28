@@ -1,5 +1,6 @@
 release/
 .claude/
+CLAUDE.md
 
 # Go
 *.exe
