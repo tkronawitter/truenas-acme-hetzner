@@ -1,5 +1,6 @@
 # TrueNAS-ACME-Hetzner
 
+[![codecov](https://codecov.io/gh/tkronawitter/truenas-acme-hetzner/branch/main/graph/badge.svg)](https://codecov.io/gh/tkronawitter/truenas-acme-hetzner)
 
 Based on: https://www.truenas.com/community/threads/acme-dns-authenticator-shell-script.106589/
 
