@@ -1,14 +1,31 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
 
-	"github.com/elmasy-com/elnet/dns"
-	"github.com/elmasy-com/elnet/dns/hetzner"
+	"github.com/hetznercloud/hcloud-go/v2/hcloud"
+	"golang.org/x/net/publicsuffix"
 	"golang.org/x/sys/unix"
 )
+
+// getDomain extracts registrable domain (e.g., "example.com" from "sub.example.com")
+func getDomain(fqdn string) string {
+	domain, _ := publicsuffix.EffectiveTLDPlusOne(strings.TrimSuffix(fqdn, "."))
+	return domain
+}
+
+// getSub extracts subdomain part (e.g., "_acme-challenge.sub" from "_acme-challenge.sub.example.com")
+func getSub(fqdn string) string {
+	domain := getDomain(fqdn)
+	fqdn = strings.TrimSuffix(fqdn, ".")
+	if fqdn == domain {
+		return ""
+	}
+	return strings.TrimSuffix(fqdn, "."+domain)
+}
 
 func mustGetCommandArg() string {
 
@@ -36,7 +53,7 @@ func mustGetDomainArg() string {
 		os.Exit(1)
 	}
 
-	return dns.GetDomain(os.Args[2])
+	return getDomain(os.Args[2])
 }
 
 func mustGetValidationNameArg() string {
@@ -47,7 +64,7 @@ func mustGetValidationNameArg() string {
 		os.Exit(1)
 	}
 
-	return dns.GetSub(os.Args[3])
+	return getSub(os.Args[3])
 }
 
 func mustGetValidationContextArg() string {
@@ -96,6 +113,10 @@ func testTokenFile() error {
 	return nil
 }
 
+func newClient(token string) *hcloud.Client {
+	return hcloud.NewClient(hcloud.WithToken(token))
+}
+
 func Set() {
 
 	domain := mustGetDomainArg()
@@ -108,18 +129,53 @@ func Set() {
 		os.Exit(1)
 	}
 
-	hc := hetzner.NewClient(token)
+	ctx := context.Background()
+	client := newClient(token)
 
-	zone, err := hc.GetZoneByName(domain)
+	// Get zone by name
+	zoneName := strings.TrimSuffix(domain, ".")
+	zone, _, err := client.Zone.GetByName(ctx, zoneName)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to get zone ID for %s: %s\n", domain, err)
+		fmt.Fprintf(os.Stderr, "Failed to get zone: %s\n", err)
+		os.Exit(1)
+	}
+	if zone == nil {
+		fmt.Fprintf(os.Stderr, "Zone '%s' not found in Hetzner account\n", zoneName)
 		os.Exit(1)
 	}
 
-	_, err = hc.CreateRecord(validationName, 3600, "TXT", validationContext, zone.ID)
+	// Quote TXT value per Hetzner API requirements
+	quotedValue := fmt.Sprintf(`"%s"`, validationContext)
+
+	// Check if RRSet exists
+	rrset, _, err := client.Zone.GetRRSetByNameAndType(ctx, zone, validationName, hcloud.ZoneRRSetTypeTXT)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create test record: %s\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to get RRSet: %s\n", err)
 		os.Exit(1)
+	}
+
+	ttl := 3600
+	if rrset == nil {
+		// Create new RRSet with record
+		_, _, err := client.Zone.CreateRRSet(ctx, zone, hcloud.ZoneRRSetCreateOpts{
+			Name:    validationName,
+			Type:    hcloud.ZoneRRSetTypeTXT,
+			TTL:     &ttl,
+			Records: []hcloud.ZoneRRSetRecord{{Value: quotedValue}},
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to create RRSet: %s\n", err)
+			os.Exit(1)
+		}
+	} else {
+		// Add to existing RRSet
+		_, _, err = client.Zone.AddRRSetRecords(ctx, rrset, hcloud.ZoneRRSetAddRecordsOpts{
+			Records: []hcloud.ZoneRRSetRecord{{Value: quotedValue}},
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to add record to RRSet: %s\n", err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -135,37 +191,38 @@ func Unset() {
 		os.Exit(1)
 	}
 
-	hc := hetzner.NewClient(token)
+	ctx := context.Background()
+	client := newClient(token)
 
-	zone, err := hc.GetZoneByName(domain)
+	zoneName := strings.TrimSuffix(domain, ".")
+	zone, _, err := client.Zone.GetByName(ctx, zoneName)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to get zone ID for %s: %s\n", domain, err)
+		fmt.Fprintf(os.Stderr, "Failed to get zone: %s\n", err)
+		os.Exit(1)
+	}
+	if zone == nil {
+		fmt.Fprintf(os.Stderr, "Zone '%s' not found in Hetzner account\n", zoneName)
 		os.Exit(1)
 	}
 
-	records, err := hc.GetAllRecordsByZone(zone.ID)
+	rrset, _, err := client.Zone.GetRRSetByNameAndType(ctx, zone, validationName, hcloud.ZoneRRSetTypeTXT)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create test record: %s\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to get RRSet: %s\n", err)
+		os.Exit(1)
+	}
+	if rrset == nil {
+		fmt.Fprintf(os.Stderr, "RRSet not found\n")
 		os.Exit(1)
 	}
 
-	recordId := ""
+	// Quote value to match what was stored
+	quotedValue := fmt.Sprintf(`"%s"`, validationContext)
 
-	for i := range records {
-		if records[i].Name == validationName && records[i].Value == validationContext && records[i].Type == "TXT" {
-			recordId = records[i].ID
-			break
-		}
-	}
-
-	if recordId == "" {
-		fmt.Fprintf(os.Stderr, "Failed to get record ID: not found\n")
-		os.Exit(1)
-	}
-
-	err = hc.DeleteRecord(recordId)
+	_, _, err = client.Zone.RemoveRRSetRecords(ctx, rrset, hcloud.ZoneRRSetRemoveRecordsOpts{
+		Records: []hcloud.ZoneRRSetRecord{{Value: quotedValue}},
+	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to delete record: %s\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to remove record: %s\n", err)
 		os.Exit(1)
 	}
 }
@@ -206,25 +263,56 @@ func Test() {
 		os.Exit(1)
 	}
 
-	hc := hetzner.NewClient(token)
+	ctx := context.Background()
+	client := newClient(token)
 
-	hetznerZone, err := hc.GetZoneByName(dns.GetDomain(domain))
+	zoneName := getDomain(domain)
+	fmt.Printf("Looking up zone: %s\n", zoneName)
+
+	zone, _, err := client.Zone.GetByName(ctx, zoneName)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to get zone ID for %s: %s\n", dns.GetDomain(domain), err)
+		fmt.Fprintf(os.Stderr, "Failed to get zone: %s\n", err)
+		os.Exit(1)
+	}
+	if zone == nil {
+		fmt.Fprintf(os.Stderr, "Zone '%s' not found in Hetzner account\n", zoneName)
 		os.Exit(1)
 	}
 
-	r, err := hetzner.NewClient(token).CreateRecord("hcdcadclk", 3600, "TXT", "TEST-TRUENAS-ACME-HETZNER", hetznerZone.ID)
+	recordName := "hcdcadclk"
+	quotedValue := `"TEST-TRUENAS-ACME-HETZNER"`
+	fmt.Printf("Creating TXT record: %s = %s\n", recordName, quotedValue)
+
+	// Create test RRSet
+	ttl := 3600
+	_, _, err = client.Zone.CreateRRSet(ctx, zone, hcloud.ZoneRRSetCreateOpts{
+		Name:    recordName,
+		Type:    hcloud.ZoneRRSetTypeTXT,
+		TTL:     &ttl,
+		Records: []hcloud.ZoneRRSetRecord{{Value: quotedValue}},
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create test record: %s\n", err)
 		os.Exit(1)
 	}
 
-	err = hetzner.NewClient(token).DeleteRecord(r.ID)
+	fmt.Printf("Deleting test record...\n")
+
+	// Get the RRSet we just created to delete it
+	rrset, _, err := client.Zone.GetRRSetByNameAndType(ctx, zone, recordName, hcloud.ZoneRRSetTypeTXT)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to get test RRSet: %s\n", err)
+		os.Exit(1)
+	}
+
+	// Delete the entire RRSet
+	_, _, err = client.Zone.DeleteRRSet(ctx, rrset)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to delete test record: %s\n", err)
 		os.Exit(1)
 	}
+
+	fmt.Printf("Test passed!\n")
 }
 
 func Help() {
