@@ -299,7 +299,7 @@ func Test() {
 	// Cleanup helper (os.Exit doesn't run defers)
 	cleanup := func() {
 		if rs, _, err := client.Zone.GetRRSetByNameAndType(ctx, zone, recordName, hcloud.ZoneRRSetTypeTXT); err == nil && rs != nil {
-			client.Zone.DeleteRRSet(ctx, rs)
+			_, _ = client.Zone.DeleteRRSet(ctx, rs)
 		}
 	}
 
