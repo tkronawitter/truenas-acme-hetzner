@@ -17,7 +17,6 @@ Hetzner is [migrating DNS management](https://docs.hetzner.com/networking/dns/mi
 | **Console** | dns.hetzner.com | console.hetzner.com |
 | **API** | Hetzner DNS API | Hetzner Cloud API |
 | **Library** | `elmasy-com/elnet` | Official [`hcloud-go`](https://github.com/hetznercloud/hcloud-go) |
-| **TrueNAS CORE** | ❌ Not supported | ✅ FreeBSD binary available |
 | **Status** | ⚠️ Shutdown May 2026 | ✅ Supported |
 
 **Key dates:**
@@ -42,7 +41,7 @@ This fork is a **drop-in replacement** — same CLI interface, same config file 
 
 ## Prerequisites
 
-- TrueNAS SCALE 24.x+ or TrueNAS CORE 13.x+
+- TrueNAS SCALE 24.x+
 - Domain with DNS managed by Hetzner (migrated to Cloud Console)
 - Hetzner Cloud API token with DNS permissions
 
@@ -50,15 +49,8 @@ This fork is a **drop-in replacement** — same CLI interface, same config file 
 
 ### Download Binary
 
-**TrueNAS SCALE (Linux):**
 ```bash
 wget -O /mnt/pool/tah https://github.com/tkronawitter/truenas-acme-hetzner/releases/latest/download/tah-linux-amd64
-chmod +x /mnt/pool/tah
-```
-
-**TrueNAS CORE (FreeBSD):**
-```bash
-fetch -o /mnt/pool/tah https://github.com/tkronawitter/truenas-acme-hetzner/releases/latest/download/tah-freebsd-amd64
 chmod +x /mnt/pool/tah
 ```
 

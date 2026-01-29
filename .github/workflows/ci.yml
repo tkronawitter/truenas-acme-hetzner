@@ -26,11 +26,10 @@ jobs:
       - uses: golangci/golangci-lint-action@v6
         with:
           version: latest
-      - name: Build binaries
+      - name: Build binary
         run: |
           mkdir -p release
           GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o release/tah-linux-amd64 .
-          GOOS=freebsd GOARCH=amd64 go build -ldflags "-s -w" -o release/tah-freebsd-amd64 .
       - uses: actions/upload-artifact@v4
         with:
           name: tah-binaries
