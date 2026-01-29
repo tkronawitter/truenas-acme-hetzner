@@ -103,7 +103,7 @@ func testTokenFile() error {
 	}
 
 	if statT.Gid != uint32(os.Getegid()) {
-		fmt.Printf("Different group for config file: %d/%d\n", statT.Uid, os.Geteuid())
+		fmt.Printf("Different group for config file: %d/%d\n", statT.Gid, os.Getegid())
 	}
 
 	if statT.Mode != 0o100600 {
