@@ -296,11 +296,19 @@ func Test() {
 		os.Exit(1)
 	}
 
+	// Cleanup helper (os.Exit doesn't run defers)
+	cleanup := func() {
+		if rs, _, err := client.Zone.GetRRSetByNameAndType(ctx, zone, recordName, hcloud.ZoneRRSetTypeTXT); err == nil && rs != nil {
+			client.Zone.DeleteRRSet(ctx, rs)
+		}
+	}
+
 	fmt.Printf("Deleting test record...\n")
 
 	// Get the RRSet we just created to delete it
 	rrset, _, err := client.Zone.GetRRSetByNameAndType(ctx, zone, recordName, hcloud.ZoneRRSetTypeTXT)
 	if err != nil {
+		cleanup()
 		fmt.Fprintf(os.Stderr, "Failed to get test RRSet: %s\n", err)
 		os.Exit(1)
 	}
@@ -308,6 +316,7 @@ func Test() {
 	// Delete the entire RRSet
 	_, _, err = client.Zone.DeleteRRSet(ctx, rrset)
 	if err != nil {
+		cleanup()
 		fmt.Fprintf(os.Stderr, "Failed to delete test record: %s\n", err)
 		os.Exit(1)
 	}
