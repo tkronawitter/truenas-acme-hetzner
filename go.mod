@@ -1,4 +1,4 @@
-module github.com/g0rbe/truenas-acme-hetzner
+module github.com/tkronawitter/truenas-acme-hetzner
 
 go 1.24.0
 
