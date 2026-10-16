@@ -59,3 +59,5 @@ jobs:
             release/checksums-sha256.txt
             release/checksums-sha512.txt
           generate_release_notes: true
+          # v1.2.0-rc1 and similar stay pre-releases, so releases/latest keeps pointing at a stable build
+          prerelease: ${{ contains(github.ref_name, '-') }}
