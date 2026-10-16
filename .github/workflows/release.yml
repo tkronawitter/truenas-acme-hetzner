@@ -34,9 +34,11 @@ jobs:
           go-version: '1.24'
       - uses: sigstore/cosign-installer@v3
       - name: Build binary
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
           mkdir -p release
-          GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o release/tah-linux-amd64 .
+          GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -X main.Version=$VERSION" -o release/tah-linux-amd64 .
       - name: Sign binary with Cosign
         run: |
           cosign sign-blob --yes \

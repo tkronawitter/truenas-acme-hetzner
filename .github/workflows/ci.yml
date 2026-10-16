@@ -17,6 +17,11 @@ jobs:
       - run: go mod download
       - run: go mod verify
       - run: go test -v -race -coverprofile=coverage.out ./...
+      - name: Enforce coverage threshold
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ { sub("%", "", $3); print $3 }')
+          echo "Total coverage: ${total}%"
+          awk -v t="$total" 'BEGIN { if (t + 0 < 70) { print "Coverage below 70%"; exit 1 } }'
       - uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
