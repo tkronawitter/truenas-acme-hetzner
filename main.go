@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 	"golang.org/x/net/publicsuffix"
@@ -16,7 +18,12 @@ import (
 var Version = "dev"
 
 const (
-	txtTTL         = 3600
+	// Challenge records live for minutes. A short TTL keeps resolvers from
+	// serving an old challenge value when TrueNAS retries soon after a failure.
+	txtTTL = 60
+	// apiTimeout bounds a whole command, including waiting for Hetzner actions,
+	// so a stalled API call cannot block the TrueNAS certificate job.
+	apiTimeout     = 2 * time.Minute
 	testRecordName = "hcdcadclk"
 	testRecordText = "TEST-TRUENAS-ACME-HETZNER"
 )
@@ -33,12 +40,13 @@ Command:
 `
 
 // app holds everything a command touches outside its arguments, so tests can
-// swap the output streams, the token file and the Hetzner API endpoint.
+// swap the output streams, the token file, the Hetzner API endpoint and the timeout.
 type app struct {
 	stdout    io.Writer
 	stderr    io.Writer
 	tokenPath string
 	newClient func(token string) *hcloud.Client
+	timeout   time.Duration
 }
 
 // usageError marks invalid command line input; run prints the help hint after it.
@@ -97,6 +105,13 @@ func recordArgs(args []string) (domain, name, value string, err error) {
 // quoteTXT quotes a TXT value as the Hetzner API stores it.
 func quoteTXT(value string) string {
 	return fmt.Sprintf(`"%s"`, value)
+}
+
+// hasRecord reports whether rrset contains the (already quoted) value.
+func hasRecord(rrset *hcloud.ZoneRRSet, value string) bool {
+	return slices.ContainsFunc(rrset.Records, func(r hcloud.ZoneRRSetRecord) bool {
+		return r.Value == value
+	})
 }
 
 func readToken(path string) (string, error) {
@@ -158,19 +173,22 @@ func deleteRRSetIfExists(ctx context.Context, client *hcloud.Client, zone *hclou
 	return deleteRRSet(ctx, client, rrset)
 }
 
-func (a app) cmdSet(args []string) error {
+// cmdSet adds the challenge value and returns once Hetzner has applied it, so
+// TrueNAS does not ask for validation too early. Setting a value that is
+// already present is a no-op.
+func (a app) cmdSet(ctx context.Context, args []string) error {
 	domain, name, value, err := recordArgs(args)
 	if err != nil {
 		return err
 	}
 
-	ctx := context.Background()
 	client, zone, err := a.connect(ctx, domain)
 	if err != nil {
 		return err
 	}
 
-	records := []hcloud.ZoneRRSetRecord{{Value: quoteTXT(value)}}
+	value = quoteTXT(value)
+	records := []hcloud.ZoneRRSetRecord{{Value: value}}
 
 	rrset, _, err := client.Zone.GetRRSetByNameAndType(ctx, zone, name, hcloud.ZoneRRSetTypeTXT)
 	if err != nil {
@@ -178,7 +196,7 @@ func (a app) cmdSet(args []string) error {
 	}
 
 	if rrset == nil {
-		_, _, err = client.Zone.CreateRRSet(ctx, zone, hcloud.ZoneRRSetCreateOpts{
+		result, _, err := client.Zone.CreateRRSet(ctx, zone, hcloud.ZoneRRSetCreateOpts{
 			Name:    name,
 			Type:    hcloud.ZoneRRSetTypeTXT,
 			TTL:     hcloud.Ptr(txtTTL),
@@ -187,40 +205,68 @@ func (a app) cmdSet(args []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to create RRSet: %w", err)
 		}
+		if err := client.Action.WaitFor(ctx, result.Action); err != nil {
+			return fmt.Errorf("failed to create RRSet: %w", err)
+		}
 		return nil
 	}
 
-	_, _, err = client.Zone.AddRRSetRecords(ctx, rrset, hcloud.ZoneRRSetAddRecordsOpts{Records: records})
+	if hasRecord(rrset, value) {
+		a.printf("Record already present, nothing to add\n")
+		return nil
+	}
+
+	action, _, err := client.Zone.AddRRSetRecords(ctx, rrset, hcloud.ZoneRRSetAddRecordsOpts{Records: records})
 	if err != nil {
+		return fmt.Errorf("failed to add record to RRSet: %w", err)
+	}
+	if err := client.Action.WaitFor(ctx, action); err != nil {
 		return fmt.Errorf("failed to add record to RRSet: %w", err)
 	}
 	return nil
 }
 
-func (a app) cmdUnset(args []string) error {
+// cmdUnset removes the challenge value and waits for Hetzner to apply it.
+// A value or RRSet that is already gone counts as success, so a repeated
+// cleanup does not fail the TrueNAS job.
+func (a app) cmdUnset(ctx context.Context, args []string) error {
 	domain, name, value, err := recordArgs(args)
 	if err != nil {
 		return err
 	}
 
-	ctx := context.Background()
 	client, zone, err := a.connect(ctx, domain)
 	if err != nil {
 		return err
 	}
 
+	value = quoteTXT(value)
+
 	rrset, _, err := client.Zone.GetRRSetByNameAndType(ctx, zone, name, hcloud.ZoneRRSetTypeTXT)
 	if err != nil {
 		return fmt.Errorf("failed to get RRSet: %w", err)
 	}
-	if rrset == nil {
-		return errors.New("RRSet not found")
+	if rrset == nil || !hasRecord(rrset, value) {
+		a.printf("Record not found, nothing to remove\n")
+		return nil
 	}
 
-	_, _, err = client.Zone.RemoveRRSetRecords(ctx, rrset, hcloud.ZoneRRSetRemoveRecordsOpts{
-		Records: []hcloud.ZoneRRSetRecord{{Value: quoteTXT(value)}},
+	// Removing the last record would leave an empty RRSet, which the API may
+	// reject; deleting the RRSet has the same effect and is always valid.
+	if len(rrset.Records) == 1 {
+		if err := deleteRRSet(ctx, client, rrset); err != nil {
+			return fmt.Errorf("failed to delete RRSet: %w", err)
+		}
+		return nil
+	}
+
+	action, _, err := client.Zone.RemoveRRSetRecords(ctx, rrset, hcloud.ZoneRRSetRemoveRecordsOpts{
+		Records: []hcloud.ZoneRRSetRecord{{Value: value}},
 	})
 	if err != nil {
+		return fmt.Errorf("failed to remove record: %w", err)
+	}
+	if err := client.Action.WaitFor(ctx, action); err != nil {
 		return fmt.Errorf("failed to remove record: %w", err)
 	}
 	return nil
@@ -246,7 +292,7 @@ func (a app) cmdInit() error {
 	return nil
 }
 
-func (a app) cmdTest(args []string) (err error) {
+func (a app) cmdTest(ctx context.Context, args []string) (err error) {
 	domain, err := domainArg(args)
 	if err != nil {
 		return err
@@ -259,8 +305,6 @@ func (a app) cmdTest(args []string) (err error) {
 	for _, w := range warnings {
 		a.printf("%s\n", w)
 	}
-
-	ctx := context.Background()
 
 	a.printf("Looking up zone: %s\n", domain)
 	client, zone, err := a.connect(ctx, domain)
@@ -277,7 +321,7 @@ func (a app) cmdTest(args []string) (err error) {
 	quotedValue := quoteTXT(testRecordText)
 	a.printf("Creating TXT record: %s = %s\n", testRecordName, quotedValue)
 
-	_, _, err = client.Zone.CreateRRSet(ctx, zone, hcloud.ZoneRRSetCreateOpts{
+	result, _, err := client.Zone.CreateRRSet(ctx, zone, hcloud.ZoneRRSetCreateOpts{
 		Name:    testRecordName,
 		Type:    hcloud.ZoneRRSetTypeTXT,
 		TTL:     hcloud.Ptr(txtTTL),
@@ -293,6 +337,11 @@ func (a app) cmdTest(args []string) (err error) {
 			_ = deleteRRSetIfExists(ctx, client, zone, testRecordName)
 		}
 	}()
+
+	// The same wait set does, so test fails where set would
+	if err = client.Action.WaitFor(ctx, result.Action); err != nil {
+		return fmt.Errorf("failed to create test record: %w", err)
+	}
 
 	a.printf("Deleting test record...\n")
 
@@ -319,19 +368,22 @@ func run(args []string, a app) int {
 		prog = args[0]
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), a.timeout)
+	defer cancel()
+
 	var err error
 	if len(args) < 2 {
 		err = usageError{"Command is missing!"}
 	} else {
 		switch args[1] {
 		case "set":
-			err = a.cmdSet(args)
+			err = a.cmdSet(ctx, args)
 		case "unset":
-			err = a.cmdUnset(args)
+			err = a.cmdUnset(ctx, args)
 		case "init":
 			err = a.cmdInit()
 		case "test":
-			err = a.cmdTest(args)
+			err = a.cmdTest(ctx, args)
 		case "version", "--version":
 			a.printf("%s\n", Version)
 		case "help":
@@ -342,6 +394,11 @@ func run(args []string, a app) int {
 	}
 
 	if err != nil {
+		// Checked on the context, not on err: how a cancelled request is
+		// wrapped depends on hcloud-go and net/http.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			err = fmt.Errorf("%w (timed out after %s)", err, a.timeout)
+		}
 		_, _ = fmt.Fprintln(a.stderr, err)
 		var ue usageError
 		if errors.As(err, &ue) {
@@ -358,5 +415,6 @@ func main() {
 		stderr:    os.Stderr,
 		tokenPath: os.ExpandEnv("$HOME/.tahtoken"),
 		newClient: newClient,
+		timeout:   apiTimeout,
 	}))
 }

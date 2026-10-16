@@ -27,28 +27,35 @@ const (
 // with a single zone, example.com. It serves the real hcloud-go client, so the
 // tests cover the request paths and bodies the binary actually sends.
 //
-// Deleting an RRSet returns a running action, and the RRSet only disappears
-// once a client polls that action, as with the real asynchronous API.
+// Every change returns a running action that only finishes once a client
+// polls it, as with the real asynchronous API. A deleted RRSet disappears at
+// that point, and while an action on an RRSet runs, adding or removing records
+// is rejected as locked. A command that does not wait for its action leaves it
+// running, which unfinished reports and a following command runs into.
 type fakeHetzner struct {
 	t   *testing.T
 	srv *httptest.Server
 
-	mu             sync.Mutex
-	rrsets         map[string][]string // "<name>/<type>" -> record values
-	pendingDeletes map[int64]string    // running delete action ID -> rrset key
-	nextActionID   int64
-	calls          []string                      // "METHOD /path" in order
-	failAt         map[string]int                // call -> occurrence (1-based) answered with an API error
-	lastCreate     schema.ZoneRRSetCreateRequest // body of the last create call
+	mu           sync.Mutex
+	rrsets       map[string][]string // "<name>/<type>" -> record values
+	running      map[int64]string    // running action ID -> rrset key
+	deletes      map[int64]bool      // running action IDs that delete their rrset
+	nextActionID int64
+	calls        []string                      // "METHOD /path" in order
+	failAt       map[string]int                // call -> occurrence (1-based) answered with an API error
+	hangOn       string                        // call that never answers until the client gives up
+	failActions  bool                          // polled actions finish with status error
+	lastCreate   schema.ZoneRRSetCreateRequest // body of the last create call
 }
 
 func newFakeHetzner(t *testing.T) *fakeHetzner {
 	t.Helper()
 	f := &fakeHetzner{
-		t:              t,
-		rrsets:         map[string][]string{},
-		pendingDeletes: map[int64]string{},
-		failAt:         map[string]int{},
+		t:       t,
+		rrsets:  map[string][]string{},
+		running: map[int64]string{},
+		deletes: map[int64]bool{},
+		failAt:  map[string]int{},
 	}
 
 	zone := "/zones/" + strconv.Itoa(fakeZoneID)
@@ -86,7 +93,30 @@ func (f *fakeHetzner) app() (app, *bytes.Buffer, *bytes.Buffer) {
 				hcloud.WithPollOpts(hcloud.PollOpts{BackoffFunc: hcloud.ConstantBackoff(time.Millisecond)}),
 			)
 		},
+		timeout: 10 * time.Second,
 	}, stdout, stderr
+}
+
+// unfinished returns the IDs of actions no client has waited for.
+func (f *fakeHetzner) unfinished() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var ids []int64
+	for id := range f.running {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// locked reports whether an action on key is still running; the caller must hold f.mu.
+func (f *fakeHetzner) locked(key string) bool {
+	for _, k := range f.running {
+		if k == key {
+			return true
+		}
+	}
+	return false
 }
 
 // failOn makes the n-th occurrence of call (e.g. "DELETE /zones/42/rrsets/x/TXT") fail.
@@ -132,8 +162,13 @@ func (f *fakeHetzner) middleware(next http.Handler) http.Handler {
 			}
 		}
 		fail := f.failAt[call] == n
+		hang := f.hangOn == call
 		f.mu.Unlock()
 
+		if hang {
+			<-r.Context().Done()
+			return
+		}
 		if fail {
 			writeError(w, http.StatusUnprocessableEntity, "invalid_input", "injected failure")
 			return
@@ -152,10 +187,11 @@ func writeError(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, schema.ErrorResponse{Error: schema.Error{Code: code, Message: msg}})
 }
 
-// action returns a new action; the caller must hold f.mu.
-func (f *fakeHetzner) action(command, status string) schema.Action {
+// action returns a new running action on the rrset key; the caller must hold f.mu.
+func (f *fakeHetzner) action(command, key string) schema.Action {
 	f.nextActionID++
-	return schema.Action{ID: f.nextActionID, Command: command, Status: status}
+	f.running[f.nextActionID] = key
+	return schema.Action{ID: f.nextActionID, Command: command, Status: "running"}
 }
 
 // rrsetSchema renders a stored RRSet; the caller must hold f.mu.
@@ -213,7 +249,7 @@ func (f *fakeHetzner) createRRSet(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusCreated, schema.ZoneRRSetCreateResponse{
 		RRSet:  f.rrsetSchema(req.Name, req.Type),
-		Action: f.action("create_rrset", "running"),
+		Action: f.action("create_rrset", key),
 	})
 }
 
@@ -225,13 +261,14 @@ func (f *fakeHetzner) deleteRRSet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "rrset not found")
 		return
 	}
-	a := f.action("delete_rrset", "running")
-	f.pendingDeletes[a.ID] = key
+	a := f.action("delete_rrset", key)
+	f.deletes[a.ID] = true
 	writeJSON(w, http.StatusCreated, schema.ActionGetResponse{Action: a})
 }
 
 // listActions answers the action waiter's poll: every requested action is
-// reported finished, and a finished delete takes effect now.
+// reported finished (or failed with failActions), and a finished delete takes
+// effect now.
 func (f *fakeHetzner) listActions(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -242,9 +279,24 @@ func (f *fakeHetzner) listActions(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid_input", err.Error())
 			return
 		}
-		if key, ok := f.pendingDeletes[id]; ok {
+		key, ok := f.running[id]
+		if !ok {
+			f.t.Errorf("poll for unknown or already finished action %d", id)
+			continue
+		}
+		delete(f.running, id)
+
+		if f.failActions {
+			resp.Actions = append(resp.Actions, schema.Action{
+				ID:     id,
+				Status: "error",
+				Error:  &schema.ActionError{Code: "action_failed", Message: "injected action failure"},
+			})
+			continue
+		}
+		if f.deletes[id] {
 			delete(f.rrsets, key)
-			delete(f.pendingDeletes, id)
+			delete(f.deletes, id)
 		}
 		resp.Actions = append(resp.Actions, schema.Action{ID: id, Status: "success"})
 	}
@@ -267,6 +319,10 @@ func (f *fakeHetzner) rrsetAction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "rrset not found")
 		return
 	}
+	if f.locked(key) {
+		writeError(w, http.StatusLocked, "locked", "rrset is locked by a running action")
+		return
+	}
 
 	switch r.PathValue("action") {
 	case "add_records":
@@ -281,5 +337,5 @@ func (f *fakeHetzner) rrsetAction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "unknown action")
 		return
 	}
-	writeJSON(w, http.StatusCreated, schema.ActionGetResponse{Action: f.action(r.PathValue("action"), "running")})
+	writeJSON(w, http.StatusCreated, schema.ActionGetResponse{Action: f.action(r.PathValue("action"), key)})
 }
