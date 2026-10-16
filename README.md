@@ -111,6 +111,14 @@ tah <command> <domain> <validation_name> <validation_context>
 
 Exit code 0 means success, 1 means failure; TrueNAS only looks at the exit code.
 
+### How `set` and `unset` behave
+
+- **They return once the change is live.** Hetzner applies DNS changes asynchronously. `set` and `unset` wait until Hetzner reports the change as done, so TrueNAS does not ask for validation too early. If Hetzner reports the change as failed, the command exits 1.
+- **They are safe to repeat.** `set` with a value that is already there changes nothing and exits 0. `unset` exits 0 when the value or the whole record set is already gone, so a repeated cleanup does not fail the certificate job.
+- **Several values per name work.** A certificate for `example.com` and `*.example.com` puts two values under `_acme-challenge.example.com`. Both are kept until each is removed. Removing the last value deletes the record set.
+- **Short TTL.** Challenge records are created with a TTL of 60 seconds, so a retry soon after a failed validation is not answered with an old cached value.
+- **Timeout.** Every command gives up after 2 minutes, including the wait for Hetzner, and exits 1 with `timed out after 2m0s`.
+
 ### Test Configuration
 ```bash
 /mnt/pool/tah test nas.example.com
