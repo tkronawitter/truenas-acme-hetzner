@@ -1,10 +1,10 @@
 module github.com/tkronawitter/truenas-acme-hetzner
 
-go 1.24.0
+go 1.26.0
 
 require (
 	github.com/hetznercloud/hcloud-go/v2 v2.36.0
-	golang.org/x/net v0.49.0
+	golang.org/x/net v0.60.0
 )
 
 require (
@@ -16,7 +16,7 @@ require (
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
-	golang.org/x/sys v0.40.0 // indirect
-	golang.org/x/text v0.33.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
 )
