@@ -108,7 +108,10 @@ func recordArgs(args []string) (domain, name, value string, err error) {
 	return domain, getSub(args[3]), args[4], nil
 }
 
-// quoteTXT quotes a TXT value as the Hetzner API expects it.
+// quoteTXT quotes a TXT value as the Hetzner API expects it: quotes inside the
+// value are escaped, and values over 255 characters are split into several
+// quoted strings. ACME challenge values (43 base64url characters) only get the
+// surrounding quotes.
 func quoteTXT(value string) string {
 	return zoneutil.FormatTXTRecord(value)
 }
@@ -274,8 +277,9 @@ func (a app) cmdUnset(ctx context.Context, args []string) error {
 		return nil
 	}
 
-	// Removing the last record might leave an empty RRSet, which the API may
-	// not accept; deleting the RRSet has the same effect and is always valid.
+	// Delete the RRSet instead of removing its last record. Whether the API
+	// accepts or keeps an empty RRSet is not verified; deleting has the same
+	// effect either way.
 	if len(rrset.Records) == 1 {
 		if err := deleteRRSet(ctx, client, rrset); err != nil {
 			return fmt.Errorf("failed to delete RRSet: %w", err)
