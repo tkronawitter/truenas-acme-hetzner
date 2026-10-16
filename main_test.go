@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGetDomain(t *testing.T) {
@@ -152,8 +153,17 @@ func TestSetCreatesRRSet(t *testing.T) {
 	}
 
 	req := f.lastCreate
-	if req.Type != "TXT" || req.TTL == nil || *req.TTL != 3600 {
-		t.Errorf("create request type = %q ttl = %v, want TXT and 3600", req.Type, req.TTL)
+	if req.Type != "TXT" || req.TTL == nil || *req.TTL != 60 {
+		t.Errorf("create request type = %q ttl = %v, want TXT and 60", req.Type, req.TTL)
+	}
+	assertAllWaited(t, f)
+}
+
+// assertAllWaited fails if a command returned without waiting for an action it started.
+func assertAllWaited(t *testing.T, f *fakeHetzner) {
+	t.Helper()
+	if ids := f.unfinished(); len(ids) > 0 {
+		t.Errorf("actions %v were never waited for", ids)
 	}
 }
 
@@ -173,6 +183,48 @@ func TestSetAddsToExistingRRSet(t *testing.T) {
 	if f.called("POST /zones/42/rrsets") {
 		t.Error("set must add to the existing RRSet, not create a new one")
 	}
+	assertAllWaited(t, f)
+}
+
+// A certificate for example.com and *.example.com puts two values under the
+// same name, one set call right after the other. The second call only gets
+// through if the first one waited until its RRSet was no longer locked.
+func TestSetTwoValuesForTheSameName(t *testing.T) {
+	f := newFakeHetzner(t)
+
+	for _, value := range []string{"apex", "wildcard"} {
+		code, _, stderr := runCmd(f, "set", "example.com", "_acme-challenge.example.com", value)
+		if code != 0 {
+			t.Fatalf("set %s: exit code = %d, stderr = %q", value, code, stderr)
+		}
+	}
+
+	got, _ := f.records("_acme-challenge")
+	if !slices.Equal(got, []string{`"apex"`, `"wildcard"`}) {
+		t.Errorf("records = %v, want both values", got)
+	}
+	assertAllWaited(t, f)
+}
+
+func TestSetValueAlreadyPresent(t *testing.T) {
+	f := newFakeHetzner(t)
+	f.addRecords("_acme-challenge", `"token-value"`)
+
+	code, stdout, stderr := runCmd(f, "set", "example.com", "_acme-challenge.example.com", "token-value")
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr)
+	}
+	if !strings.Contains(stdout, "Record already present") {
+		t.Errorf("stdout = %q, want the already present note", stdout)
+	}
+
+	got, _ := f.records("_acme-challenge")
+	if !slices.Equal(got, []string{`"token-value"`}) {
+		t.Errorf("records = %v, want the value exactly once", got)
+	}
+	if f.called("POST /zones/42/rrsets/_acme-challenge/TXT/actions/add_records") {
+		t.Error("set must not add a value that is already present")
+	}
 }
 
 func TestUnsetRemovesRecord(t *testing.T) {
@@ -188,12 +240,75 @@ func TestUnsetRemovesRecord(t *testing.T) {
 	if !slices.Equal(got, []string{`"keep"`}) {
 		t.Errorf("records = %v, want only the other value left", got)
 	}
+	assertAllWaited(t, f)
 }
 
-func TestUnsetRRSetNotFound(t *testing.T) {
-	code, _, stderr := runCmd(newFakeHetzner(t), "unset", "example.com", "_acme-challenge.example.com", "x")
-	if code != 1 || !strings.Contains(stderr, "RRSet not found") {
-		t.Errorf("exit code = %d, stderr = %q, want 1 and RRSet not found", code, stderr)
+func TestUnsetDeletesRRSetWithLastRecord(t *testing.T) {
+	f := newFakeHetzner(t)
+	f.addRecords("_acme-challenge", `"drop"`)
+
+	code, _, stderr := runCmd(f, "unset", "example.com", "_acme-challenge.example.com", "drop")
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr)
+	}
+
+	if got, ok := f.records("_acme-challenge"); ok {
+		t.Errorf("RRSet still exists with %v, want it deleted", got)
+	}
+	if f.called("POST /zones/42/rrsets/_acme-challenge/TXT/actions/remove_records") {
+		t.Error("the last record must be removed by deleting the RRSet")
+	}
+	assertAllWaited(t, f)
+}
+
+func TestUnsetNothingToRemove(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing []string
+	}{
+		{"RRSet missing", nil},
+		{"value missing", []string{`"other"`}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakeHetzner(t)
+			if tt.existing != nil {
+				f.addRecords("_acme-challenge", tt.existing...)
+			}
+
+			code, stdout, stderr := runCmd(f, "unset", "example.com", "_acme-challenge.example.com", "x")
+			if code != 0 {
+				t.Fatalf("exit code = %d, stderr = %q, want 0 for a value that is already gone", code, stderr)
+			}
+			if !strings.Contains(stdout, "Record not found, nothing to remove") {
+				t.Errorf("stdout = %q, want the nothing to remove note", stdout)
+			}
+			for _, v := range tt.existing {
+				if !strings.Contains(stdout, v) {
+					t.Errorf("stdout = %q, want the stored value %s for diagnosis", stdout, v)
+				}
+			}
+			got, _ := f.records("_acme-challenge")
+			if !slices.Equal(got, tt.existing) {
+				t.Errorf("records = %v, want unchanged %v", got, tt.existing)
+			}
+		})
+	}
+}
+
+func TestUnsetTwice(t *testing.T) {
+	f := newFakeHetzner(t)
+	f.addRecords("_acme-challenge", `"x"`)
+
+	for i := 1; i <= 2; i++ {
+		code, _, stderr := runCmd(f, "unset", "example.com", "_acme-challenge.example.com", "x")
+		if code != 0 {
+			t.Fatalf("unset run %d: exit code = %d, stderr = %q", i, code, stderr)
+		}
+	}
+	if _, ok := f.records("_acme-challenge"); ok {
+		t.Error("RRSet still exists")
 	}
 }
 
@@ -240,36 +355,173 @@ func TestMissingToken(t *testing.T) {
 
 func TestAPIErrors(t *testing.T) {
 	const rrset = "/zones/42/rrsets/_acme-challenge/TXT"
+	var (
+		none     []string
+		other    = []string{`"other"`}
+		only     = []string{`"x"`}
+		withMore = []string{`"x"`, `"other"`}
+	)
 	tests := []struct {
 		name     string
-		existing bool
-		args     []string
+		existing []string
+		cmd      string
 		fail     string
 		wantErr  string
 	}{
-		{"set zone lookup", false, []string{"set"}, "GET /zones/example.com", "failed to get zone"},
-		{"set rrset lookup", false, []string{"set"}, "GET " + rrset, "failed to get RRSet"},
-		{"set create", false, []string{"set"}, "POST /zones/42/rrsets", "failed to create RRSet"},
-		{"set add", true, []string{"set"}, "POST " + rrset + "/actions/add_records", "failed to add record to RRSet"},
-		{"unset zone lookup", true, []string{"unset"}, "GET /zones/example.com", "failed to get zone"},
-		{"unset rrset lookup", true, []string{"unset"}, "GET " + rrset, "failed to get RRSet"},
-		{"unset remove", true, []string{"unset"}, "POST " + rrset + "/actions/remove_records", "failed to remove record"},
+		{"set zone lookup", none, "set", "GET /zones/example.com", "failed to get zone"},
+		{"set rrset lookup", none, "set", "GET " + rrset, "failed to get RRSet"},
+		{"set create", none, "set", "POST /zones/42/rrsets", "failed to create RRSet"},
+		{"set wait for create", none, "set", "GET /actions", "failed to create RRSet"},
+		{"set add", other, "set", "POST " + rrset + "/actions/add_records", "failed to add record to RRSet"},
+		{"set wait for add", other, "set", "GET /actions", "failed to add record to RRSet"},
+		{"unset zone lookup", withMore, "unset", "GET /zones/example.com", "failed to get zone"},
+		{"unset rrset lookup", withMore, "unset", "GET " + rrset, "failed to get RRSet"},
+		{"unset remove", withMore, "unset", "POST " + rrset + "/actions/remove_records", "failed to remove record"},
+		{"unset wait for remove", withMore, "unset", "GET /actions", "failed to remove record"},
+		{"unset delete last record", only, "unset", "DELETE " + rrset, "failed to delete RRSet"},
+		{"unset wait for delete", only, "unset", "GET /actions", "failed to delete RRSet"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newFakeHetzner(t)
-			if tt.existing {
-				f.addRecords("_acme-challenge", `"x"`)
+			if tt.existing != nil {
+				f.addRecords("_acme-challenge", tt.existing...)
 			}
 			f.failOn(tt.fail, 1)
 
-			args := append(tt.args, "example.com", "_acme-challenge.example.com", "x")
-			code, _, stderr := runCmd(f, args...)
+			code, _, stderr := runCmd(f, tt.cmd, "example.com", "_acme-challenge.example.com", "x")
 			if code != 1 || !strings.Contains(stderr, tt.wantErr) || !strings.Contains(stderr, "injected failure") {
 				t.Errorf("exit code = %d, stderr = %q, want 1 and %q with the API message", code, stderr, tt.wantErr)
 			}
 		})
+	}
+}
+
+// An action the API accepted can still fail; the command must report it, not exit 0.
+func TestActionFailures(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing []string
+		args     []string
+		wantErr  string
+	}{
+		{"set create", nil, []string{"set", "example.com", "_acme-challenge.example.com", "x"}, "failed to create RRSet"},
+		{"set add", []string{`"other"`}, []string{"set", "example.com", "_acme-challenge.example.com", "x"}, "failed to add record to RRSet"},
+		{"unset remove", []string{`"x"`, `"other"`}, []string{"unset", "example.com", "_acme-challenge.example.com", "x"}, "failed to remove record"},
+		{"unset delete", []string{`"x"`}, []string{"unset", "example.com", "_acme-challenge.example.com", "x"}, "failed to delete RRSet"},
+		{"test create", nil, []string{"test", "example.com"}, "failed to create test record"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakeHetzner(t)
+			if tt.existing != nil {
+				f.addRecords("_acme-challenge", tt.existing...)
+			}
+			f.failActions = true
+
+			code, _, stderr := runCmd(f, tt.args...)
+			if code != 1 || !strings.Contains(stderr, tt.wantErr) || !strings.Contains(stderr, "injected action failure") {
+				t.Errorf("exit code = %d, stderr = %q, want 1 and %q with the action error", code, stderr, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestTimeout(t *testing.T) {
+	tests := []struct {
+		name string
+		hang string
+		args []string
+	}{
+		{"set zone lookup", "GET /zones/example.com", []string{"set", "example.com", "_acme-challenge.example.com", "x"}},
+		{"set wait for action", "GET /actions", []string{"set", "example.com", "_acme-challenge.example.com", "x"}},
+		{"unset zone lookup", "GET /zones/example.com", []string{"unset", "example.com", "_acme-challenge.example.com", "x"}},
+		{"test zone lookup", "GET /zones/example.com", []string{"test", "example.com"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := tt.args
+			f := newFakeHetzner(t)
+			f.hangOn = tt.hang
+			a, _, stderr := f.app()
+			a.timeout = 50 * time.Millisecond
+
+			start := time.Now()
+			code := run(append([]string{"tah"}, args...), a)
+			if elapsed := time.Since(start); elapsed > 5*time.Second {
+				t.Errorf("command took %s, want it to give up after the timeout", elapsed)
+			}
+			if code != 1 || !strings.Contains(stderr.String(), "timed out after 50ms") {
+				t.Errorf("exit code = %d, stderr = %q, want 1 and the timeout", code, stderr.String())
+			}
+		})
+	}
+}
+
+// After a timeout the deadline of the command is used up; the cleanup of the
+// test record must still run on its own deadline.
+func TestTestCommandCleansUpAfterTimeout(t *testing.T) {
+	f := newFakeHetzner(t)
+	f.hangOn = "GET /actions"
+	a, _, stderr := f.app()
+	a.timeout = 50 * time.Millisecond
+
+	if code := run([]string{"tah", "test", "example.com"}, a); code != 1 {
+		t.Fatalf("exit code = %d, stderr = %q, want 1", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "timed out after 50ms") {
+		t.Errorf("stderr = %q, want the timeout", stderr.String())
+	}
+	if _, ok := f.records(testRecordName); ok {
+		t.Error("test record still exists after the timeout")
+	}
+}
+
+// The API may store a value in another form than quoteTXT produces, for
+// example split into several strings. Matching works on the parsed value, and
+// removal sends the stored form back.
+func TestStoredValueInAnotherForm(t *testing.T) {
+	const stored = `"tok" "en"`
+
+	t.Run("set", func(t *testing.T) {
+		f := newFakeHetzner(t)
+		f.addRecords("_acme-challenge", stored)
+
+		code, stdout, stderr := runCmd(f, "set", "example.com", "_acme-challenge.example.com", "token")
+		if code != 0 || !strings.Contains(stdout, "Record already present") {
+			t.Fatalf("exit code = %d, stdout = %q, stderr = %q, want 0 and already present", code, stdout, stderr)
+		}
+		if got, _ := f.records("_acme-challenge"); !slices.Equal(got, []string{stored}) {
+			t.Errorf("records = %v, want only the stored value", got)
+		}
+	})
+
+	t.Run("unset", func(t *testing.T) {
+		f := newFakeHetzner(t)
+		f.addRecords("_acme-challenge", stored, `"other"`)
+
+		code, _, stderr := runCmd(f, "unset", "example.com", "_acme-challenge.example.com", "token")
+		if code != 0 {
+			t.Fatalf("exit code = %d, stderr = %q", code, stderr)
+		}
+		if got, _ := f.records("_acme-challenge"); !slices.Equal(got, []string{`"other"`}) {
+			t.Errorf("records = %v, want only the other value left", got)
+		}
+	})
+}
+
+func TestQuoteTXT(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"abc-DEF_123", `"abc-DEF_123"`},
+		{`say "hi"`, `"say \"hi\""`},
+	}
+	for _, tt := range tests {
+		if got := quoteTXT(tt.in); got != tt.want {
+			t.Errorf("quoteTXT(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }
 
@@ -289,6 +541,7 @@ func TestTestCommand(t *testing.T) {
 	if !f.called("POST /zones/42/rrsets") || !f.called("DELETE /zones/42/rrsets/"+testRecordName+"/TXT") {
 		t.Errorf("test must create and delete the record, calls %v", f.calls)
 	}
+	assertAllWaited(t, f)
 }
 
 func TestTestCommandRemovesLeftoverRecord(t *testing.T) {
@@ -319,8 +572,9 @@ func TestTestCommandFailures(t *testing.T) {
 		{"leftover delete", true, "DELETE " + rrset, 1, "failed to remove leftover test record", false},
 		{"create", false, "POST /zones/42/rrsets", 1, "failed to create test record", false},
 		{"lookup after create", false, "GET " + rrset, 2, "failed to get test RRSet", true},
+		{"wait for create", false, "GET /actions", 1, "failed to create test record", true},
 		{"delete", false, "DELETE " + rrset, 1, "failed to delete test record", true},
-		{"wait for delete", false, "GET /actions", 1, "failed to delete test record", true},
+		{"wait for delete", false, "GET /actions", 2, "failed to delete test record", true},
 		{"wait for leftover delete", true, "GET /actions", 1, "failed to remove leftover test record", false},
 	}
 
