@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
+	"github.com/hetznercloud/hcloud-go/v2/hcloud/exp/zoneutil"
 	"golang.org/x/net/publicsuffix"
 )
 
@@ -22,8 +23,13 @@ const (
 	// serving an old challenge value when TrueNAS retries soon after a failure.
 	txtTTL = 60
 	// apiTimeout bounds a whole command, including waiting for Hetzner actions,
-	// so a stalled API call cannot block the TrueNAS certificate job.
-	apiTimeout     = 2 * time.Minute
+	// so a stalled API call cannot block the TrueNAS certificate job. It stays
+	// below the default TrueNAS "Script Timeout" of 60s, so tah reports the
+	// timeout itself instead of being killed in the middle of a wait.
+	apiTimeout = 50 * time.Second
+	// cleanupTimeout gives the test command's cleanup its own time budget,
+	// because it also has to run after apiTimeout has expired.
+	cleanupTimeout = 10 * time.Second
 	testRecordName = "hcdcadclk"
 	testRecordText = "TEST-TRUENAS-ACME-HETZNER"
 )
@@ -102,16 +108,31 @@ func recordArgs(args []string) (domain, name, value string, err error) {
 	return domain, getSub(args[3]), args[4], nil
 }
 
-// quoteTXT quotes a TXT value as the Hetzner API stores it.
+// quoteTXT quotes a TXT value as the Hetzner API expects it.
 func quoteTXT(value string) string {
-	return fmt.Sprintf(`"%s"`, value)
+	return zoneutil.FormatTXTRecord(value)
 }
 
-// hasRecord reports whether rrset contains the (already quoted) value.
-func hasRecord(rrset *hcloud.ZoneRRSet, value string) bool {
-	return slices.ContainsFunc(rrset.Records, func(r hcloud.ZoneRRSetRecord) bool {
-		return r.Value == value
+// findRecord returns the record of rrset that holds the unquoted value, in the
+// form the API stores it. Values are compared after parsing, so a different
+// quoting or chunking on the server side still matches.
+func findRecord(rrset *hcloud.ZoneRRSet, value string) (hcloud.ZoneRRSetRecord, bool) {
+	i := slices.IndexFunc(rrset.Records, func(r hcloud.ZoneRRSetRecord) bool {
+		return r.Value == value || zoneutil.ParseTXTRecord(r.Value) == value
 	})
+	if i < 0 {
+		return hcloud.ZoneRRSetRecord{}, false
+	}
+	return rrset.Records[i], true
+}
+
+// recordValues lists the stored values of rrset for diagnostic output.
+func recordValues(rrset *hcloud.ZoneRRSet) []string {
+	values := make([]string, 0, len(rrset.Records))
+	for _, r := range rrset.Records {
+		values = append(values, r.Value)
+	}
+	return values
 }
 
 func readToken(path string) (string, error) {
@@ -187,8 +208,7 @@ func (a app) cmdSet(ctx context.Context, args []string) error {
 		return err
 	}
 
-	value = quoteTXT(value)
-	records := []hcloud.ZoneRRSetRecord{{Value: value}}
+	records := []hcloud.ZoneRRSetRecord{{Value: quoteTXT(value)}}
 
 	rrset, _, err := client.Zone.GetRRSetByNameAndType(ctx, zone, name, hcloud.ZoneRRSetTypeTXT)
 	if err != nil {
@@ -211,7 +231,7 @@ func (a app) cmdSet(ctx context.Context, args []string) error {
 		return nil
 	}
 
-	if hasRecord(rrset, value) {
+	if _, ok := findRecord(rrset, value); ok {
 		a.printf("Record already present, nothing to add\n")
 		return nil
 	}
@@ -240,19 +260,22 @@ func (a app) cmdUnset(ctx context.Context, args []string) error {
 		return err
 	}
 
-	value = quoteTXT(value)
-
 	rrset, _, err := client.Zone.GetRRSetByNameAndType(ctx, zone, name, hcloud.ZoneRRSetTypeTXT)
 	if err != nil {
 		return fmt.Errorf("failed to get RRSet: %w", err)
 	}
-	if rrset == nil || !hasRecord(rrset, value) {
+	if rrset == nil {
 		a.printf("Record not found, nothing to remove\n")
 		return nil
 	}
+	record, ok := findRecord(rrset, value)
+	if !ok {
+		a.printf("Record not found, nothing to remove (stored values: %s)\n", strings.Join(recordValues(rrset), ", "))
+		return nil
+	}
 
-	// Removing the last record would leave an empty RRSet, which the API may
-	// reject; deleting the RRSet has the same effect and is always valid.
+	// Removing the last record might leave an empty RRSet, which the API may
+	// not accept; deleting the RRSet has the same effect and is always valid.
 	if len(rrset.Records) == 1 {
 		if err := deleteRRSet(ctx, client, rrset); err != nil {
 			return fmt.Errorf("failed to delete RRSet: %w", err)
@@ -261,7 +284,8 @@ func (a app) cmdUnset(ctx context.Context, args []string) error {
 	}
 
 	action, _, err := client.Zone.RemoveRRSetRecords(ctx, rrset, hcloud.ZoneRRSetRemoveRecordsOpts{
-		Records: []hcloud.ZoneRRSetRecord{{Value: value}},
+		// The stored form, so the API matches it even if it differs from quoteTXT
+		Records: []hcloud.ZoneRRSetRecord{record},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to remove record: %w", err)
@@ -331,10 +355,13 @@ func (a app) cmdTest(ctx context.Context, args []string) (err error) {
 		return fmt.Errorf("failed to create test record: %w", err)
 	}
 
-	// Best-effort cleanup if anything below fails
+	// Best-effort cleanup if anything below fails. It gets its own deadline,
+	// because a timeout has already used up ctx.
 	defer func() {
 		if err != nil {
-			_ = deleteRRSetIfExists(ctx, client, zone, testRecordName)
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+			defer cancel()
+			_ = deleteRRSetIfExists(cleanupCtx, client, zone, testRecordName)
 		}
 	}()
 

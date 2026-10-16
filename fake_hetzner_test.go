@@ -43,7 +43,7 @@ type fakeHetzner struct {
 	nextActionID int64
 	calls        []string                      // "METHOD /path" in order
 	failAt       map[string]int                // call -> occurrence (1-based) answered with an API error
-	hangOn       string                        // call that never answers until the client gives up
+	hangOn       string                        // call whose first occurrence never answers until the client gives up
 	failActions  bool                          // polled actions finish with status error
 	lastCreate   schema.ZoneRRSetCreateRequest // body of the last create call
 }
@@ -162,7 +162,7 @@ func (f *fakeHetzner) middleware(next http.Handler) http.Handler {
 			}
 		}
 		fail := f.failAt[call] == n
-		hang := f.hangOn == call
+		hang := f.hangOn == call && n == 1
 		f.mu.Unlock()
 
 		if hang {

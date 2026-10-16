@@ -284,6 +284,11 @@ func TestUnsetNothingToRemove(t *testing.T) {
 			if !strings.Contains(stdout, "Record not found, nothing to remove") {
 				t.Errorf("stdout = %q, want the nothing to remove note", stdout)
 			}
+			for _, v := range tt.existing {
+				if !strings.Contains(stdout, v) {
+					t.Errorf("stdout = %q, want the stored value %s for diagnosis", stdout, v)
+				}
+			}
 			got, _ := f.records("_acme-challenge")
 			if !slices.Equal(got, tt.existing) {
 				t.Errorf("records = %v, want unchanged %v", got, tt.existing)
@@ -425,14 +430,22 @@ func TestActionFailures(t *testing.T) {
 }
 
 func TestTimeout(t *testing.T) {
-	for _, args := range [][]string{
-		{"set", "example.com", "_acme-challenge.example.com", "x"},
-		{"unset", "example.com", "_acme-challenge.example.com", "x"},
-		{"test", "example.com"},
-	} {
-		t.Run(args[0], func(t *testing.T) {
+	tests := []struct {
+		name string
+		hang string
+		args []string
+	}{
+		{"set zone lookup", "GET /zones/example.com", []string{"set", "example.com", "_acme-challenge.example.com", "x"}},
+		{"set wait for action", "GET /actions", []string{"set", "example.com", "_acme-challenge.example.com", "x"}},
+		{"unset zone lookup", "GET /zones/example.com", []string{"unset", "example.com", "_acme-challenge.example.com", "x"}},
+		{"test zone lookup", "GET /zones/example.com", []string{"test", "example.com"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := tt.args
 			f := newFakeHetzner(t)
-			f.hangOn = "GET /zones/example.com"
+			f.hangOn = tt.hang
 			a, _, stderr := f.app()
 			a.timeout = 50 * time.Millisecond
 
@@ -445,6 +458,70 @@ func TestTimeout(t *testing.T) {
 				t.Errorf("exit code = %d, stderr = %q, want 1 and the timeout", code, stderr.String())
 			}
 		})
+	}
+}
+
+// After a timeout the deadline of the command is used up; the cleanup of the
+// test record must still run on its own deadline.
+func TestTestCommandCleansUpAfterTimeout(t *testing.T) {
+	f := newFakeHetzner(t)
+	f.hangOn = "GET /actions"
+	a, _, stderr := f.app()
+	a.timeout = 50 * time.Millisecond
+
+	if code := run([]string{"tah", "test", "example.com"}, a); code != 1 {
+		t.Fatalf("exit code = %d, stderr = %q, want 1", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "timed out after 50ms") {
+		t.Errorf("stderr = %q, want the timeout", stderr.String())
+	}
+	if _, ok := f.records(testRecordName); ok {
+		t.Error("test record still exists after the timeout")
+	}
+}
+
+// The API may store a value in another form than quoteTXT produces, for
+// example split into several strings. Matching works on the parsed value, and
+// removal sends the stored form back.
+func TestStoredValueInAnotherForm(t *testing.T) {
+	const stored = `"tok" "en"`
+
+	t.Run("set", func(t *testing.T) {
+		f := newFakeHetzner(t)
+		f.addRecords("_acme-challenge", stored)
+
+		code, stdout, stderr := runCmd(f, "set", "example.com", "_acme-challenge.example.com", "token")
+		if code != 0 || !strings.Contains(stdout, "Record already present") {
+			t.Fatalf("exit code = %d, stdout = %q, stderr = %q, want 0 and already present", code, stdout, stderr)
+		}
+		if got, _ := f.records("_acme-challenge"); !slices.Equal(got, []string{stored}) {
+			t.Errorf("records = %v, want only the stored value", got)
+		}
+	})
+
+	t.Run("unset", func(t *testing.T) {
+		f := newFakeHetzner(t)
+		f.addRecords("_acme-challenge", stored, `"other"`)
+
+		code, _, stderr := runCmd(f, "unset", "example.com", "_acme-challenge.example.com", "token")
+		if code != 0 {
+			t.Fatalf("exit code = %d, stderr = %q", code, stderr)
+		}
+		if got, _ := f.records("_acme-challenge"); !slices.Equal(got, []string{`"other"`}) {
+			t.Errorf("records = %v, want only the other value left", got)
+		}
+	})
+}
+
+func TestQuoteTXT(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"abc-DEF_123", `"abc-DEF_123"`},
+		{`say "hi"`, `"say \"hi\""`},
+	}
+	for _, tt := range tests {
+		if got := quoteTXT(tt.in); got != tt.want {
+			t.Errorf("quoteTXT(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }
 
