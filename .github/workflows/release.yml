@@ -12,8 +12,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
       - run: go mod download
@@ -28,29 +28,38 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
-      - uses: sigstore/cosign-installer@v3
+      # Held at v3: cosign-installer v4 installs cosign v3, whose sign-blob ignores
+      # --output-signature/--output-certificate and fails without --bundle.
+      # Composite action, so it is not affected by the Node.js 20 deprecation.
+      - uses: sigstore/cosign-installer@v3.10.1
+        with:
+          cosign-release: 'v2.6.5'
       - name: Build binary
         env:
           VERSION: ${{ github.ref_name }}
         run: |
           mkdir -p release
-          GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -X main.Version=$VERSION" -o release/tah-linux-amd64 .
+          # Static binary: no dependency on the runner's glibc, which would otherwise
+          # set the minimum glibc the NAS needs
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -X main.Version=$VERSION" -o release/tah-linux-amd64 .
       - name: Sign binary with Cosign
         run: |
           cosign sign-blob --yes \
             --output-signature release/tah-linux-amd64.sig \
             --output-certificate release/tah-linux-amd64.pem \
             release/tah-linux-amd64
+          test -s release/tah-linux-amd64.sig
+          test -s release/tah-linux-amd64.pem
       - name: Generate checksums
         run: |
           cd release
           sha256sum tah-* > checksums-sha256.txt
           sha512sum tah-* > checksums-sha512.txt
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             release/tah-linux-amd64

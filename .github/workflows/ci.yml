@@ -10,8 +10,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
       - run: go mod download
@@ -22,7 +22,7 @@ jobs:
           total=$(go tool cover -func=coverage.out | awk '/^total:/ { sub("%", "", $3); print $3 }')
           echo "Total coverage: ${total}%"
           awk -v t="$total" 'BEGIN { if (t + 0 < 70) { print "Coverage below 70%"; exit 1 } }'
-      - uses: codecov/codecov-action@v5
+      - uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.out
@@ -34,8 +34,8 @@ jobs:
       - name: Build binary
         run: |
           mkdir -p release
-          GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o release/tah-linux-amd64 .
-      - uses: actions/upload-artifact@v4
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o release/tah-linux-amd64 .
+      - uses: actions/upload-artifact@v7
         with:
           name: tah-binaries
           path: release/tah-*
@@ -44,8 +44,8 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
       - run: |
