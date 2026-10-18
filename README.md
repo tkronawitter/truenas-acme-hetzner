@@ -134,9 +134,20 @@ Exit code 0 means success, 1 means failure; TrueNAS only looks at the exit code.
 In TrueNAS UI: **Credentials → Certificates → ACME DNS-Authenticators**
 - Authenticator: **Shell**
 - Script: `/mnt/pool/tah`
+- Running User: see below, the default does not work
 - Script Timeout: keep at least 60 seconds (the default)
+- Propagation Delay: see below
 
-TrueNAS runs the script as the user set in the authenticator, and tah reads the token from that user's `$HOME/.tahtoken`. Make sure that user has a home directory with the token file, and run `tah init` and `tah test` as that user.
+**Running User.** TrueNAS runs the script as this user, and tah reads the token from that user's `$HOME/.tahtoken`. The default is `nobody`, which has no usable home directory, so the token file has nowhere to live. Do not keep the default:
+
+1. Pick or create a user that has a home directory.
+2. Log in as that user (or `su` to it) and run `tah init`, then store the token as described in [Store Token](#2-store-token).
+3. As the same user, run `tah test nas.example.com`.
+4. Set that user as "Running User" in the authenticator.
+
+**Script Timeout.** Default 60 seconds, minimum 5. Keep at least 60. tah stops itself after 50 seconds and reports `timed out after 50s`. A lower value in TrueNAS kills tah in the middle of a request, without a message.
+
+**Propagation Delay.** Default 60 seconds, minimum 10. After every `set`, TrueNAS waits this long before it asks the ACME server to validate, once for each name in the certificate. A certificate for `example.com` and `*.example.com` therefore waits twice. The delay gives Hetzner's nameservers time to serve the new record. `set` already waits until Hetzner reports the change as done, but that does not mean every nameserver serves it yet, so keep the default until you have measured how long your zone takes.
 
 ## Building from Source
 
@@ -157,7 +168,8 @@ Run the tests with `go test ./...`. They use an in-memory fake of the Hetzner AP
 - [Hetzner DNS Migration Docs](https://docs.hetzner.com/networking/dns/migration-to-hetzner-console/process/)
 - [Hetzner Cloud API Token Guide](https://docs.hetzner.com/cloud/api/getting-started/generating-api-token/)
 - [hcloud-go Library](https://github.com/hetznercloud/hcloud-go)
-- [TrueNAS Shell Authenticator Source](https://github.com/truenas/middleware/blob/master/src/middlewared/middlewared/plugins/acme_protocol_/authenticators/shell.py)
+- [TrueNAS Shell Authenticator Source](https://github.com/truenas/middleware/blob/master/src/middlewared/middlewared/plugins/acme_dns_authenticator/authenticators/shell.py)
+- [TrueNAS ACME Issuance Loop](https://github.com/truenas/truenas_crypto_utils/blob/master/truenas_acme_utils/issue_cert.py)
 - [Original Project](https://github.com/g0rbe/truenas-acme-hetzner)
 
 ## License
