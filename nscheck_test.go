@@ -15,13 +15,16 @@ import (
 
 const challengeName = "_acme-challenge.example.com."
 
-// fakeDNS is an authoritative nameserver on a local UDP port. It answers TXT
-// queries for one name: NXDOMAIN (or the stale values) until the query
+// fakeDNS is an authoritative nameserver on a local UDP port. It answers every
+// TXT query the same way: NXDOMAIN (or the stale values) until the query
 // numbered appearAt, the challenge value from then on. The real resolver code
 // of the binary talks to it.
 type fakeDNS struct {
 	conn net.PacketConn
 
+	// Set by newFakeDNS before the server goroutine starts, read under mu;
+	// tests never write them afterwards (the UDP round trip is no
+	// synchronisation the race detector sees).
 	mu       sync.Mutex
 	value    string   // served from query appearAt on; "" = never
 	stale    []string // served before appearAt; nil = NXDOMAIN
@@ -29,13 +32,15 @@ type fakeDNS struct {
 	queries  int
 }
 
-func newFakeDNS(t *testing.T, value string, appearAt int) *fakeDNS {
+// newFakeDNS starts a fakeDNS that serves value from query appearAt on, and
+// stale (NOERROR with old values) or, without stale, NXDOMAIN before that.
+func newFakeDNS(t *testing.T, value string, appearAt int, stale ...string) *fakeDNS {
 	t.Helper()
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := &fakeDNS{conn: conn, value: value, appearAt: appearAt}
+	d := &fakeDNS{conn: conn, value: value, appearAt: appearAt, stale: stale}
 	t.Cleanup(func() { _ = conn.Close() })
 	go d.serve()
 	return d
@@ -74,7 +79,7 @@ func (d *fakeDNS) answer(req []byte) []byte {
 	}
 
 	var values []string
-	if q.Type == dnsmessage.TypeTXT && strings.EqualFold(q.Name.String(), challengeName) {
+	if q.Type == dnsmessage.TypeTXT {
 		d.mu.Lock()
 		d.queries++
 		if d.value != "" && d.queries >= d.appearAt {
@@ -129,7 +134,7 @@ func TestSetWaitsUntilAllNameserversServeTheValue(t *testing.T) {
 	f := newFakeHetzner(t)
 	fast := newFakeDNS(t, "token-value", 1)
 	slow := newFakeDNS(t, "token-value", 4) // NXDOMAIN for three polls
-	f.nameservers = []string{fast.addr(), slow.addr()}
+	f.setNameservers(fast.addr(), slow.addr())
 	a, _, _ := f.app()
 
 	code, stdout, stderr := runSet(a)
@@ -150,9 +155,8 @@ func TestSetWaitsUntilAllNameserversServeTheValue(t *testing.T) {
 
 func TestSetWaitsWhileANameserverServesAStaleValue(t *testing.T) {
 	f := newFakeHetzner(t)
-	ns := newFakeDNS(t, "token-value", 3)
-	ns.stale = []string{"old-token"} // NOERROR with the previous challenge, not NXDOMAIN
-	f.nameservers = []string{ns.addr()}
+	ns := newFakeDNS(t, "token-value", 3, "old-token") // NOERROR with the previous challenge, not NXDOMAIN
+	f.setNameservers(ns.addr())
 	a, _, _ := f.app()
 
 	code, stdout, stderr := runSet(a)
@@ -168,7 +172,7 @@ func TestSetNameserverCheckDeadlineWarnsAndSucceeds(t *testing.T) {
 	f := newFakeHetzner(t)
 	ok := newFakeDNS(t, "token-value", 1)
 	never := newFakeDNS(t, "", 0)
-	f.nameservers = []string{ok.addr(), never.addr()}
+	f.setNameservers(ok.addr(), never.addr())
 	a, _, _ := f.app()
 	a.ns.maxWait = 300 * time.Millisecond
 
@@ -197,7 +201,7 @@ func TestSetSomeNameserversUnreachable(t *testing.T) {
 	f := newFakeHetzner(t)
 	ok := newFakeDNS(t, "token-value", 1)
 	closed := closedUDPAddr(t)
-	f.nameservers = []string{ok.addr(), closed}
+	f.setNameservers(ok.addr(), closed)
 	a, _, _ := f.app()
 
 	code, stdout, stderr := runSet(a)
@@ -214,7 +218,7 @@ func TestSetSomeNameserversUnreachable(t *testing.T) {
 
 func TestSetAllNameserversUnreachableSkipsCheck(t *testing.T) {
 	f := newFakeHetzner(t)
-	f.nameservers = []string{"hydrogen.ns.hetzner.com", "oxygen.ns.hetzner.com"}
+	f.setNameservers("hydrogen.ns.hetzner.com", "oxygen.ns.hetzner.com")
 	a, _, _ := f.app()
 	var mu sync.Mutex
 	calls := 0
@@ -240,7 +244,7 @@ func TestSetAllNameserversUnreachableSkipsCheck(t *testing.T) {
 func TestSetNameserverHostnameDoesNotResolve(t *testing.T) {
 	// A DNSError for the nameserver's own name is not "challenge not served yet".
 	f := newFakeHetzner(t)
-	f.nameservers = []string{"ns.invalid"}
+	f.setNameservers("ns.invalid")
 	a, _, _ := f.app()
 	a.ns.lookup = func(ctx context.Context, server, name string) ([]string, error) {
 		return nil, &net.DNSError{Err: "no such host", Name: server, IsNotFound: true}
@@ -254,7 +258,7 @@ func TestSetNameserverHostnameDoesNotResolve(t *testing.T) {
 
 func TestSetSkipsCheckNearTheTimeout(t *testing.T) {
 	f := newFakeHetzner(t)
-	f.nameservers = []string{"hydrogen.ns.hetzner.com"}
+	f.setNameservers("hydrogen.ns.hetzner.com")
 	a, _, _ := f.app()
 	a.ns.lookup = func(ctx context.Context, server, name string) ([]string, error) {
 		t.Error("lookup called although too little time was left")
@@ -277,7 +281,7 @@ func TestSetCheckStaysInsideTheCommandTimeout(t *testing.T) {
 	// The cap is larger than the whole budget: the deadline minus the margin wins.
 	f := newFakeHetzner(t)
 	never := newFakeDNS(t, "", 0)
-	f.nameservers = []string{never.addr()}
+	f.setNameservers(never.addr())
 	a, _, _ := f.app()
 	a.timeout = 800 * time.Millisecond
 	a.ns.maxWait = 15 * time.Second
@@ -309,7 +313,7 @@ func TestSetAlreadyPresentStillChecks(t *testing.T) {
 	f := newFakeHetzner(t)
 	f.addRecords("_acme-challenge", `"token-value"`)
 	ns := newFakeDNS(t, "token-value", 1)
-	f.nameservers = []string{ns.addr()}
+	f.setNameservers(ns.addr())
 	a, _, _ := f.app()
 
 	code, stdout, _ := runSet(a)
@@ -322,7 +326,7 @@ func TestUnsetDoesNotCheckNameservers(t *testing.T) {
 	f := newFakeHetzner(t)
 	f.addRecords("_acme-challenge", `"token-value"`)
 	ns := newFakeDNS(t, "token-value", 1)
-	f.nameservers = []string{ns.addr()}
+	f.setNameservers(ns.addr())
 
 	code, _, stderr := runCmd(f, "unset", "example.com", "_acme-challenge.example.com", "token-value")
 	if code != 0 {
@@ -368,7 +372,7 @@ func TestSetChecksNameserversAfterARetry(t *testing.T) {
 	f := newFakeHetzner(t)
 	f.failWith("POST /zones/42/rrsets", failure{n: 1, drop: dropAfter})
 	ns := newFakeDNS(t, "token-value", 2)
-	f.nameservers = []string{ns.addr()}
+	f.setNameservers(ns.addr())
 	a, _, _ := f.app()
 
 	code, stdout, stderr := runSet(a)
@@ -388,7 +392,7 @@ func TestSetChecksNameserversAfterARetry(t *testing.T) {
 func TestSetCheckIsNotLimitedByTheRetryBudget(t *testing.T) {
 	f := newFakeHetzner(t)
 	never := newFakeDNS(t, "", 0)
-	f.nameservers = []string{never.addr()}
+	f.setNameservers(never.addr())
 	a, _, _ := f.app()
 	a.retryBudget = 200 * time.Millisecond
 	a.timeout = 5 * time.Second
@@ -413,7 +417,7 @@ func TestSetFailureSkipsNameserverCheck(t *testing.T) {
 	f := newFakeHetzner(t)
 	f.failOn("POST /zones/42/rrsets", 1) // 422, not retryable
 	ns := newFakeDNS(t, "token-value", 1)
-	f.nameservers = []string{ns.addr()}
+	f.setNameservers(ns.addr())
 
 	code, _, _ := runCmd(f, "set", "example.com", "_acme-challenge.example.com", "token-value")
 	if code != 1 {
@@ -421,6 +425,32 @@ func TestSetFailureSkipsNameserverCheck(t *testing.T) {
 	}
 	if ns.count() != 0 {
 		t.Errorf("failed set sent %d DNS queries, want none", ns.count())
+	}
+}
+
+// A record in a subzone is checked on the subzone's nameservers, the ones of
+// the zone connect found, not on the parent zone's.
+func TestSetChecksTheSubzoneNameservers(t *testing.T) {
+	f := newFakeHetzner(t)
+	f.addZone("dev.example.com")
+	parent := newFakeDNS(t, "", 0)
+	sub := newFakeDNS(t, "token-value", 2)
+	f.setNameservers(parent.addr())
+	f.setZoneNameservers("dev.example.com", sub.addr())
+	a, stdout, stderr := f.app()
+
+	code := run([]string{"tah", "set", "nas.dev.example.com", "_acme-challenge.nas.dev.example.com", "token-value"}, a)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Zone dev.example.com") || !strings.Contains(stdout.String(), "Challenge served by 1 of 1") {
+		t.Errorf("stdout = %q, want the subzone and the check on its nameserver", stdout.String())
+	}
+	if parent.count() != 0 {
+		t.Errorf("parent zone nameserver got %d queries, want none", parent.count())
+	}
+	if sub.count() != 2 {
+		t.Errorf("subzone nameserver got %d queries, want 2", sub.count())
 	}
 }
 
