@@ -69,6 +69,7 @@ type app struct {
 	retryBudget time.Duration
 	attempts    int
 	retryDelay  time.Duration
+	ns          nsCheck
 }
 
 // usageError marks invalid command line input; run prints the help hint after it.
@@ -348,20 +349,31 @@ func deleteRRSetIfExists(ctx context.Context, client *hcloud.Client, zone *hclou
 
 // cmdSet adds the challenge value and returns once Hetzner has applied it, so
 // TrueNAS does not ask for validation too early. Setting a value that is
-// already present is a no-op.
-func (a app) cmdSet(ctx context.Context, args []string) error {
+// already present is a no-op. It returns the authoritative nameservers of the
+// zone the record went into, on every successful path including "already
+// present" after a retry, for the nameserver check that run starts after the
+// retries.
+func (a app) cmdSet(ctx context.Context, args []string) ([]string, error) {
 	fqdn, candidates, value, err := recordArgs(args)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	client, zone, err := a.connect(ctx, candidates)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	name := rrsetName(fqdn, zone)
 	a.printf("Zone %s, record %s\n", zone.Name, name)
 
+	if err := a.setRecord(ctx, client, zone, name, value); err != nil {
+		return nil, err
+	}
+	return zone.AuthoritativeNameservers.Assigned, nil
+}
+
+// setRecord adds value to the TXT RRSet name and waits for the Hetzner action.
+func (a app) setRecord(ctx context.Context, client *hcloud.Client, zone *hcloud.Zone, name, value string) error {
 	records := []hcloud.ZoneRRSetRecord{{Value: quoteTXT(value)}}
 
 	rrset, _, err := client.Zone.GetRRSetByNameAndType(ctx, zone, name, hcloud.ZoneRRSetTypeTXT)
@@ -562,7 +574,18 @@ func run(args []string, a app) int {
 	} else {
 		switch args[1] {
 		case "set":
-			err = a.withRetry(ctx, func(ctx context.Context) error { return a.cmdSet(ctx, args) })
+			var servers []string
+			err = a.withRetry(ctx, func(ctx context.Context) error {
+				var setErr error
+				servers, setErr = a.cmdSet(ctx, args)
+				return setErr
+			})
+			// Outside withRetry, so the check gets the rest of the command
+			// budget (at most apiTimeout-retryBudget), not what is left of
+			// the retry budget. It only warns, so it never triggers a retry.
+			if err == nil {
+				a.waitForNameservers(ctx, servers, args[3], args[4])
+			}
 		case "unset":
 			err = a.withRetry(ctx, func(ctx context.Context) error { return a.cmdUnset(ctx, args) })
 		case "init":
@@ -606,6 +629,7 @@ func defaultApp() app {
 		retryBudget: retryBudget,
 		attempts:    retryAttempts,
 		retryDelay:  retryDelay,
+		ns:          defaultNSCheck(),
 	}
 }
 

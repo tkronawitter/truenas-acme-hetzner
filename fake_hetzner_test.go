@@ -51,6 +51,7 @@ type fakeHetzner struct {
 	hangOn       string                        // call whose first occurrence never answers until the client gives up
 	failActions  bool                          // polled actions finish with status error
 	lastCreate   schema.ZoneRRSetCreateRequest // body of the last create call
+	nameservers  []string                      // authoritative_nameservers.assigned of the zone
 }
 
 func newFakeHetzner(t *testing.T) *fakeHetzner {
@@ -102,6 +103,14 @@ func (f *fakeHetzner) app() (app, *bytes.Buffer, *bytes.Buffer) {
 		retryBudget: 10 * time.Second,
 		attempts:    retryAttempts,
 		retryDelay:  time.Millisecond,
+		ns: nsCheck{
+			lookup:       lookupTXTDirect,
+			maxWait:      2 * time.Second,
+			margin:       100 * time.Millisecond,
+			minWait:      50 * time.Millisecond,
+			interval:     10 * time.Millisecond,
+			queryTimeout: 500 * time.Millisecond,
+		},
 	}, stdout, stderr
 }
 
@@ -332,7 +341,14 @@ func (f *fakeHetzner) getZone(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "zone not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, schema.ZoneGetResponse{Zone: schema.Zone{ID: id, Name: name}})
+	f.mu.Lock()
+	ns := slices.Clone(f.nameservers)
+	f.mu.Unlock()
+	writeJSON(w, http.StatusOK, schema.ZoneGetResponse{Zone: schema.Zone{
+		ID:                       id,
+		Name:                     name,
+		AuthoritativeNameservers: schema.ZoneAuthoritativeNameservers{Assigned: ns},
+	}})
 }
 
 func (f *fakeHetzner) getRRSet(w http.ResponseWriter, r *http.Request) {
