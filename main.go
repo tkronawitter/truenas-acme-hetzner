@@ -81,47 +81,68 @@ func (a app) printf(format string, args ...any) {
 	_, _ = fmt.Fprintf(a.stdout, format, args...)
 }
 
-// getDomain extracts registrable domain (e.g., "example.com" from "sub.example.com")
-func getDomain(fqdn string) string {
-	domain, _ := publicsuffix.EffectiveTLDPlusOne(strings.TrimSuffix(fqdn, "."))
-	return domain
-}
-
-// getSub extracts subdomain part (e.g., "_acme-challenge.sub" from "_acme-challenge.sub.example.com")
-func getSub(fqdn string) string {
-	domain := getDomain(fqdn)
-	fqdn = strings.TrimSuffix(fqdn, ".")
-	if fqdn == domain {
-		return ""
-	}
-	return strings.TrimSuffix(fqdn, "."+domain)
-}
-
-func domainArg(args []string) (string, error) {
-	if len(args) < 3 {
-		return "", usageError{"domain is missing!"}
-	}
-	domain := getDomain(args[2])
-	if domain == "" {
-		return "", usageError{fmt.Sprintf("Invalid domain: %s!", args[2])}
-	}
-	return domain, nil
-}
-
-// recordArgs returns the zone, the RRSet name inside it and the TXT value
-// for set and unset: <domain> <validation_name> <validation_context>.
-func recordArgs(args []string) (domain, name, value string, err error) {
-	domain, err = domainArg(args)
+// zoneCandidates returns the names that may be the Hetzner zone holding name,
+// most specific first, down to the registrable domain (e.g. "example.com" or
+// "example.co.uk"); public suffixes such as "com" are never candidates. With
+// self, name itself is the first candidate. Names are compared in lower case
+// without a trailing dot, the form Hetzner stores zone names in. ok is false
+// for a name without a registrable domain.
+func zoneCandidates(name string, self bool) (candidates []string, ok bool) {
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	apex, err := publicsuffix.EffectiveTLDPlusOne(name)
 	if err != nil {
-		return "", "", "", err
+		return nil, false
+	}
+	for c := name; ; {
+		if c != name || self {
+			candidates = append(candidates, c)
+		}
+		if c == apex {
+			return candidates, true
+		}
+		_, c, _ = strings.Cut(c, ".")
+	}
+}
+
+// domainArg returns the zone candidates for <domain>, the argument of test.
+// set and unset only check that <domain> is valid; their zone comes from
+// validation_name, which may lie in another zone (CNAME delegation).
+func domainArg(args []string) ([]string, error) {
+	if len(args) < 3 {
+		return nil, usageError{"domain is missing!"}
+	}
+	candidates, ok := zoneCandidates(args[2], true)
+	if !ok {
+		return nil, usageError{fmt.Sprintf("Invalid domain: %s!", args[2])}
+	}
+	return candidates, nil
+}
+
+// recordArgs returns the validation name, the zone candidates for it and the
+// TXT value for set and unset: <domain> <validation_name> <validation_context>.
+// The validation name itself is not a candidate: a challenge record never sits
+// at a zone apex, and a name with an underscore label is no valid zone name.
+func recordArgs(args []string) (name string, candidates []string, value string, err error) {
+	if _, err := domainArg(args); err != nil {
+		return "", nil, "", err
 	}
 	if len(args) < 4 {
-		return "", "", "", usageError{"validation_name is missing!"}
+		return "", nil, "", usageError{"validation_name is missing!"}
 	}
 	if len(args) < 5 {
-		return "", "", "", usageError{"validation_context is missing!"}
+		return "", nil, "", usageError{"validation_context is missing!"}
 	}
-	return domain, getSub(args[3]), args[4], nil
+	candidates, ok := zoneCandidates(args[3], false)
+	if !ok || len(candidates) == 0 {
+		return "", nil, "", usageError{fmt.Sprintf("Invalid validation_name: %s!", args[3])}
+	}
+	return strings.ToLower(strings.TrimSuffix(args[3], ".")), candidates, args[4], nil
+}
+
+// rrsetName returns name relative to zone, e.g. "_acme-challenge.nas" for
+// "_acme-challenge.nas.example.com" in example.com.
+func rrsetName(name string, zone *hcloud.Zone) string {
+	return strings.TrimSuffix(name, "."+strings.ToLower(zone.Name))
 }
 
 // quoteTXT quotes a TXT value as the Hetzner API expects it: quotes inside the
@@ -284,22 +305,27 @@ func newClient(token string) *hcloud.Client {
 	return hcloud.NewClient(clientOptions(token)...)
 }
 
-// connect reads the token, builds the API client and looks up the zone.
-func (a app) connect(ctx context.Context, domain string) (*hcloud.Client, *hcloud.Zone, error) {
+// connect reads the token, builds the API client and returns the first of the
+// candidates that is a zone in the Hetzner account, so the most specific zone
+// wins: with example.com and dev.example.com in the account, a name under
+// dev.example.com goes to dev.example.com.
+func (a app) connect(ctx context.Context, candidates []string) (*hcloud.Client, *hcloud.Zone, error) {
 	token, err := readToken(a.tokenPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get token: %w", err)
 	}
 	client := a.newClient(token)
 
-	zone, _, err := client.Zone.GetByName(ctx, domain)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get zone: %w", err)
+	for _, name := range candidates {
+		zone, _, err := client.Zone.GetByName(ctx, name)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to get zone %s: %w", name, err)
+		}
+		if zone != nil {
+			return client, zone, nil
+		}
 	}
-	if zone == nil {
-		return nil, nil, fmt.Errorf("zone '%s' not found in Hetzner account", domain)
-	}
-	return client, zone, nil
+	return nil, nil, fmt.Errorf("no zone in the Hetzner account matches (tried %s)", strings.Join(candidates, ", "))
 }
 
 // deleteRRSet deletes rrset and waits for the deletion to finish, so the
@@ -324,15 +350,17 @@ func deleteRRSetIfExists(ctx context.Context, client *hcloud.Client, zone *hclou
 // TrueNAS does not ask for validation too early. Setting a value that is
 // already present is a no-op.
 func (a app) cmdSet(ctx context.Context, args []string) error {
-	domain, name, value, err := recordArgs(args)
+	fqdn, candidates, value, err := recordArgs(args)
 	if err != nil {
 		return err
 	}
 
-	client, zone, err := a.connect(ctx, domain)
+	client, zone, err := a.connect(ctx, candidates)
 	if err != nil {
 		return err
 	}
+	name := rrsetName(fqdn, zone)
+	a.printf("Zone %s, record %s\n", zone.Name, name)
 
 	records := []hcloud.ZoneRRSetRecord{{Value: quoteTXT(value)}}
 
@@ -376,15 +404,17 @@ func (a app) cmdSet(ctx context.Context, args []string) error {
 // A value or RRSet that is already gone counts as success, so a repeated
 // cleanup does not fail the TrueNAS job.
 func (a app) cmdUnset(ctx context.Context, args []string) error {
-	domain, name, value, err := recordArgs(args)
+	fqdn, candidates, value, err := recordArgs(args)
 	if err != nil {
 		return err
 	}
 
-	client, zone, err := a.connect(ctx, domain)
+	client, zone, err := a.connect(ctx, candidates)
 	if err != nil {
 		return err
 	}
+	name := rrsetName(fqdn, zone)
+	a.printf("Zone %s, record %s\n", zone.Name, name)
 
 	rrset, _, err := client.Zone.GetRRSetByNameAndType(ctx, zone, name, hcloud.ZoneRRSetTypeTXT)
 	if err != nil {
@@ -444,7 +474,7 @@ func (a app) cmdInit() error {
 }
 
 func (a app) cmdTest(ctx context.Context, args []string) (err error) {
-	domain, err := domainArg(args)
+	candidates, err := domainArg(args)
 	if err != nil {
 		return err
 	}
@@ -457,11 +487,12 @@ func (a app) cmdTest(ctx context.Context, args []string) (err error) {
 		a.printf("%s\n", w)
 	}
 
-	a.printf("Looking up zone: %s\n", domain)
-	client, zone, err := a.connect(ctx, domain)
+	a.printf("Looking up zone for: %s\n", candidates[0])
+	client, zone, err := a.connect(ctx, candidates)
 	if err != nil {
 		return err
 	}
+	a.printf("Found zone: %s\n", zone.Name)
 
 	// A run that died between create and delete leaves the test RRSet behind,
 	// and CreateRRSet would then fail on every later run.
