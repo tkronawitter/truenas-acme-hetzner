@@ -64,6 +64,22 @@ Store the binary on a dataset, as in these examples. TrueNAS mounts `/tmp` with 
 wget -O /mnt/pool/tah https://github.com/tkronawitter/truenas-acme-hetzner/releases/download/v1.2.0-rc1/tah-linux-amd64
 ```
 
+### Verify the Download (optional)
+
+Each release carries a Sigstore signature (`tah-linux-amd64.sig`) and certificate (`tah-linux-amd64.pem`) created by the release workflow. To check the binary with [cosign](https://github.com/sigstore/cosign), download both files from the same release page, set `VERSION` to the tag you downloaded, and run:
+
+```bash
+VERSION=v1.2.0
+cosign verify-blob \
+  --certificate tah-linux-amd64.pem \
+  --signature tah-linux-amd64.sig \
+  --certificate-identity "https://github.com/tkronawitter/truenas-acme-hetzner/.github/workflows/release.yml@refs/tags/${VERSION}" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  tah-linux-amd64
+```
+
+Expected output: `Verified OK`. cosign 3.x prints a deprecation warning for `--signature` and `--certificate`; the check still works.
+
 ### Initialize
 ```bash
 /mnt/pool/tah init
