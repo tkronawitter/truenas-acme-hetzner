@@ -25,9 +25,10 @@ const (
 	fakeZoneID = 42
 )
 
-// fakeHetzner is an in-memory stand-in for the Hetzner Cloud zone/RRSet API
-// with a single zone, example.com. It serves the real hcloud-go client, so the
-// tests cover the request paths and bodies the binary actually sends.
+// fakeHetzner is an in-memory stand-in for the Hetzner Cloud zone/RRSet API.
+// It starts with one zone, example.com (ID 42); addZone adds more. It serves
+// the real hcloud-go client, so the tests cover the request paths and bodies
+// the binary actually sends.
 //
 // Every change returns a running action that only finishes once a client
 // polls it, as with the real asynchronous API. A deleted RRSet disappears at
@@ -39,7 +40,8 @@ type fakeHetzner struct {
 	srv *httptest.Server
 
 	mu           sync.Mutex
-	rrsets       map[string][]string // "<name>/<type>" -> record values
+	zones        map[string]int64    // zone name -> ID
+	rrsets       map[string][]string // "<zone ID>/<name>/<type>" -> record values
 	running      map[int64]string    // running action ID -> rrset key
 	deletes      map[int64]bool      // running action IDs that delete their rrset
 	nextActionID int64
@@ -55,19 +57,19 @@ func newFakeHetzner(t *testing.T) *fakeHetzner {
 	t.Helper()
 	f := &fakeHetzner{
 		t:       t,
+		zones:   map[string]int64{fakeZone: fakeZoneID},
 		rrsets:  map[string][]string{},
 		running: map[int64]string{},
 		deletes: map[int64]bool{},
 		failAt:  map[string]failure{},
 	}
 
-	zone := "/zones/" + strconv.Itoa(fakeZoneID)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /zones/{zone}", f.getZone)
-	mux.HandleFunc("GET "+zone+"/rrsets/{name}/{type}", f.getRRSet)
-	mux.HandleFunc("POST "+zone+"/rrsets", f.createRRSet)
-	mux.HandleFunc("DELETE "+zone+"/rrsets/{name}/{type}", f.deleteRRSet)
-	mux.HandleFunc("POST "+zone+"/rrsets/{name}/{type}/actions/{action}", f.rrsetAction)
+	mux.HandleFunc("GET /zones/{zone}/rrsets/{name}/{type}", f.getRRSet)
+	mux.HandleFunc("POST /zones/{zone}/rrsets", f.createRRSet)
+	mux.HandleFunc("DELETE /zones/{zone}/rrsets/{name}/{type}", f.deleteRRSet)
+	mux.HandleFunc("POST /zones/{zone}/rrsets/{name}/{type}/actions/{action}", f.rrsetAction)
 	mux.HandleFunc("GET /actions", f.listActions)
 
 	f.srv = httptest.NewServer(f.middleware(mux))
@@ -170,18 +172,48 @@ func (f *fakeHetzner) count(call string) int {
 	return n
 }
 
-func (f *fakeHetzner) addRecords(name string, values ...string) {
+// addZone adds a zone to the account and returns its ID.
+func (f *fakeHetzner) addZone(name string) int64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.rrsets[name+"/TXT"] = append(f.rrsets[name+"/TXT"], values...)
+	id := fakeZoneID + int64(len(f.zones))
+	f.zones[name] = id
+	return id
 }
 
-// records returns the values of a TXT RRSet and whether it exists.
-func (f *fakeHetzner) records(name string) ([]string, bool) {
+func rrsetKey(zoneID int64, name, typ string) string {
+	return strconv.FormatInt(zoneID, 10) + "/" + name + "/" + typ
+}
+
+// addRecords adds TXT values to an RRSet of example.com.
+func (f *fakeHetzner) addRecords(name string, values ...string) {
+	f.addRecordsIn(fakeZoneID, name, values...)
+}
+
+func (f *fakeHetzner) addRecordsIn(zoneID int64, name string, values ...string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	v, ok := f.rrsets[name+"/TXT"]
+	key := rrsetKey(zoneID, name, "TXT")
+	f.rrsets[key] = append(f.rrsets[key], values...)
+}
+
+// records returns the values of a TXT RRSet of example.com and whether it exists.
+func (f *fakeHetzner) records(name string) ([]string, bool) {
+	return f.recordsIn(fakeZoneID, name)
+}
+
+func (f *fakeHetzner) recordsIn(zoneID int64, name string) ([]string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.rrsets[rrsetKey(zoneID, name, "TXT")]
 	return slices.Clone(v), ok
+}
+
+// rrsetCount returns how many RRSets exist across all zones.
+func (f *fakeHetzner) rrsetCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.rrsets)
 }
 
 func (f *fakeHetzner) called(call string) bool {
@@ -263,37 +295,59 @@ func (f *fakeHetzner) action(command, key string) schema.Action {
 }
 
 // rrsetSchema renders a stored RRSet; the caller must hold f.mu.
-func (f *fakeHetzner) rrsetSchema(name, typ string) schema.ZoneRRSet {
+func (f *fakeHetzner) rrsetSchema(zoneID int64, name, typ string) schema.ZoneRRSet {
 	rs := schema.ZoneRRSet{
 		ID:   name + "/" + typ,
 		Name: name,
 		Type: typ,
 		TTL:  new(txtTTL),
-		Zone: fakeZoneID,
+		Zone: zoneID,
 	}
-	for _, v := range f.rrsets[name+"/"+typ] {
+	for _, v := range f.rrsets[rrsetKey(zoneID, name, typ)] {
 		rs.Records = append(rs.Records, schema.ZoneRRSetRecord{Value: v})
 	}
 	return rs
 }
 
+// zoneID returns the ID in the {zone} path segment of r if that zone exists,
+// otherwise it answers 404; the caller must hold f.mu.
+func (f *fakeHetzner) zoneID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	if id, err := strconv.ParseInt(r.PathValue("zone"), 10, 64); err == nil {
+		for _, z := range f.zones {
+			if z == id {
+				return id, true
+			}
+		}
+	}
+	writeError(w, http.StatusNotFound, "not_found", "zone not found")
+	return 0, false
+}
+
 func (f *fakeHetzner) getZone(w http.ResponseWriter, r *http.Request) {
-	if r.PathValue("zone") != fakeZone {
+	name := r.PathValue("zone")
+	f.mu.Lock()
+	id, ok := f.zones[name]
+	f.mu.Unlock()
+	if !ok {
 		writeError(w, http.StatusNotFound, "not_found", "zone not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, schema.ZoneGetResponse{Zone: schema.Zone{ID: fakeZoneID, Name: fakeZone}})
+	writeJSON(w, http.StatusOK, schema.ZoneGetResponse{Zone: schema.Zone{ID: id, Name: name}})
 }
 
 func (f *fakeHetzner) getRRSet(w http.ResponseWriter, r *http.Request) {
 	name, typ := r.PathValue("name"), r.PathValue("type")
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.rrsets[name+"/"+typ]; !ok {
+	zoneID, ok := f.zoneID(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := f.rrsets[rrsetKey(zoneID, name, typ)]; !ok {
 		writeError(w, http.StatusNotFound, "not_found", "rrset not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, schema.ZoneRRSetGetResponse{RRSet: f.rrsetSchema(name, typ)})
+	writeJSON(w, http.StatusOK, schema.ZoneRRSetGetResponse{RRSet: f.rrsetSchema(zoneID, name, typ)})
 }
 
 func (f *fakeHetzner) createRRSet(w http.ResponseWriter, r *http.Request) {
@@ -305,8 +359,12 @@ func (f *fakeHetzner) createRRSet(w http.ResponseWriter, r *http.Request) {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	zoneID, ok := f.zoneID(w, r)
+	if !ok {
+		return
+	}
 	f.lastCreate = req
-	key := req.Name + "/" + req.Type
+	key := rrsetKey(zoneID, req.Name, req.Type)
 	if _, ok := f.rrsets[key]; ok {
 		writeError(w, http.StatusConflict, "uniqueness_error", "rrset already exists")
 		return
@@ -316,15 +374,19 @@ func (f *fakeHetzner) createRRSet(w http.ResponseWriter, r *http.Request) {
 		f.rrsets[key] = append(f.rrsets[key], rec.Value)
 	}
 	writeJSON(w, http.StatusCreated, schema.ZoneRRSetCreateResponse{
-		RRSet:  f.rrsetSchema(req.Name, req.Type),
+		RRSet:  f.rrsetSchema(zoneID, req.Name, req.Type),
 		Action: f.action("create_rrset", key),
 	})
 }
 
 func (f *fakeHetzner) deleteRRSet(w http.ResponseWriter, r *http.Request) {
-	key := r.PathValue("name") + "/" + r.PathValue("type")
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	zoneID, ok := f.zoneID(w, r)
+	if !ok {
+		return
+	}
+	key := rrsetKey(zoneID, r.PathValue("name"), r.PathValue("type"))
 	if _, ok := f.rrsets[key]; !ok {
 		writeError(w, http.StatusNotFound, "not_found", "rrset not found")
 		return
@@ -372,7 +434,6 @@ func (f *fakeHetzner) listActions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *fakeHetzner) rrsetAction(w http.ResponseWriter, r *http.Request) {
-	key := r.PathValue("name") + "/" + r.PathValue("type")
 	var req struct {
 		Records []schema.ZoneRRSetRecord `json:"records"`
 	}
@@ -383,6 +444,11 @@ func (f *fakeHetzner) rrsetAction(w http.ResponseWriter, r *http.Request) {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	zoneID, ok := f.zoneID(w, r)
+	if !ok {
+		return
+	}
+	key := rrsetKey(zoneID, r.PathValue("name"), r.PathValue("type"))
 	if _, ok := f.rrsets[key]; !ok {
 		writeError(w, http.StatusNotFound, "not_found", "rrset not found")
 		return

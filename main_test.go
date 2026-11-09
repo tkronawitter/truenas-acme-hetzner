@@ -5,59 +5,12 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
-
-func TestGetDomain(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		{"example.com", "example.com"},
-		{"sub.example.com", "example.com"},
-		{"_acme-challenge.sub.example.com", "example.com"},
-		{"example.com.", "example.com"},
-		{"deep.nested.sub.example.co.uk", "example.co.uk"},
-		{"example.co.uk", "example.co.uk"},
-		{"test.example.org", "example.org"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got := getDomain(tt.input)
-			if got != tt.expected {
-				t.Errorf("getDomain(%q) = %q, want %q", tt.input, got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestGetSub(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		{"example.com", ""},
-		{"sub.example.com", "sub"},
-		{"_acme-challenge.sub.example.com", "_acme-challenge.sub"},
-		{"example.com.", ""},
-		{"deep.nested.example.com", "deep.nested"},
-		{"_acme-challenge.example.com", "_acme-challenge"},
-		{"a.b.c.example.co.uk", "a.b.c"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got := getSub(tt.input)
-			if got != tt.expected {
-				t.Errorf("getSub(%q) = %q, want %q", tt.input, got, tt.expected)
-			}
-		})
-	}
-}
 
 // runCmd runs tah with the given arguments against f and returns exit code, stdout, stderr.
 func runCmd(f *fakeHetzner, args ...string) (int, string, string) {
@@ -315,17 +268,156 @@ func TestUnsetTwice(t *testing.T) {
 }
 
 func TestZoneNotFound(t *testing.T) {
-	for _, args := range [][]string{
-		{"set", "other.org", "_acme-challenge.other.org", "x"},
-		{"unset", "other.org", "_acme-challenge.other.org", "x"},
-		{"test", "other.org"},
-	} {
-		t.Run(args[0], func(t *testing.T) {
-			code, _, stderr := runCmd(newFakeHetzner(t), args...)
-			if code != 1 || !strings.Contains(stderr, "zone 'other.org' not found") {
-				t.Errorf("exit code = %d, stderr = %q, want 1 and zone not found", code, stderr)
+	tests := []struct {
+		args  []string
+		tried string
+	}{
+		{[]string{"set", "other.org", "_acme-challenge.nas.other.org", "x"}, "(tried nas.other.org, other.org)"},
+		{[]string{"unset", "other.org", "_acme-challenge.other.org", "x"}, "(tried other.org)"},
+		{[]string{"test", "nas.other.org"}, "(tried nas.other.org, other.org)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.args[0], func(t *testing.T) {
+			f := newFakeHetzner(t)
+			code, _, stderr := runCmd(f, tt.args...)
+			if code != 1 || !strings.Contains(stderr, "no zone in the Hetzner account matches "+tt.tried) {
+				t.Errorf("exit code = %d, stderr = %q, want 1 and the names tried %s", code, stderr, tt.tried)
+			}
+			// A missing zone is final, not a transient failure
+			if strings.Contains(stderr, "Attempt") {
+				t.Errorf("stderr = %q, want no retry", stderr)
 			}
 		})
+	}
+}
+
+func TestZoneCandidates(t *testing.T) {
+	tests := []struct {
+		name string
+		self bool
+		want []string
+	}{
+		{"_acme-challenge.example.com", false, []string{"example.com"}},
+		{"_acme-challenge.nas.dev.example.com", false, []string{"nas.dev.example.com", "dev.example.com", "example.com"}},
+		{"_acme-challenge.Nas.Example.COM.", false, []string{"nas.example.com", "example.com"}},
+		{"_acme-challenge.a.example.co.uk", false, []string{"a.example.co.uk", "example.co.uk"}},
+		{"example.com", false, nil},
+		{"example.com", true, []string{"example.com"}},
+		{"nas.example.com.", true, []string{"nas.example.com", "example.com"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := zoneCandidates(tt.name, tt.self)
+			if !ok || !slices.Equal(got, tt.want) {
+				t.Errorf("zoneCandidates(%q, %v) = %v, %v, want %v", tt.name, tt.self, got, ok, tt.want)
+			}
+		})
+	}
+
+	for _, name := range []string{"com", "co.uk", "localhost", ""} {
+		if got, ok := zoneCandidates(name, true); ok {
+			t.Errorf("zoneCandidates(%q) = %v, want no registrable domain", name, got)
+		}
+	}
+}
+
+func TestInvalidValidationName(t *testing.T) {
+	for _, name := range []string{"example.com", "com", "localhost"} {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeHetzner(t)
+			code, stdout, stderr := runCmd(f, "set", "example.com", name, "x")
+			if code != 1 || !strings.Contains(stderr, "Invalid validation_name: "+name+"!") || !strings.Contains(stdout, "help") {
+				t.Errorf("exit code = %d, stderr = %q, want 1 and the usage error", code, stderr)
+			}
+			if f.count("GET /zones/example.com") != 0 {
+				t.Error("an invalid validation_name must not reach the API")
+			}
+		})
+	}
+}
+
+// The record goes to the most specific zone in the account that contains
+// validation_name, independent of <domain>.
+func TestZoneLookup(t *testing.T) {
+	tests := []struct {
+		name       string
+		zones      []string // added next to example.com
+		domain     string
+		validation string
+		wantZone   string
+		wantRecord string
+	}{
+		{"apex zone", nil, "example.com", "_acme-challenge.example.com", "example.com", "_acme-challenge"},
+		{"host under apex zone", nil, "nas.example.com", "_acme-challenge.nas.example.com", "example.com", "_acme-challenge.nas"},
+		{"subdomain zone", []string{"dev.example.com"}, "nas.dev.example.com", "_acme-challenge.nas.dev.example.com",
+			"dev.example.com", "_acme-challenge.nas"},
+		{"subdomain zone is not used for a sibling", []string{"dev.example.com"}, "nas.example.com", "_acme-challenge.nas.example.com",
+			"example.com", "_acme-challenge.nas"},
+		{"delegated challenge in another zone", []string{"acme.org"}, "nas.example.com", "_acme-challenge.nas.acme.org",
+			"acme.org", "_acme-challenge.nas"},
+		{"upper case and trailing dot", []string{"dev.example.com"}, "NAS.Dev.Example.com.", "_acme-challenge.NAS.Dev.Example.com.",
+			"dev.example.com", "_acme-challenge.nas"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakeHetzner(t)
+			ids := map[string]int64{fakeZone: fakeZoneID}
+			for _, z := range tt.zones {
+				ids[z] = f.addZone(z)
+			}
+
+			code, stdout, stderr := runCmd(f, "set", tt.domain, tt.validation, "x")
+			if code != 0 {
+				t.Fatalf("set: exit code = %d, stderr = %q", code, stderr)
+			}
+			if want := "Zone " + tt.wantZone + ", record " + tt.wantRecord; !strings.Contains(stdout, want) {
+				t.Errorf("stdout = %q, want %q", stdout, want)
+			}
+			got, ok := f.recordsIn(ids[tt.wantZone], tt.wantRecord)
+			if !ok || !slices.Equal(got, []string{`"x"`}) || f.rrsetCount() != 1 {
+				t.Errorf("records in %s/%s = %v (exists %v), %d RRSets in total, want only this one",
+					tt.wantZone, tt.wantRecord, got, ok, f.rrsetCount())
+			}
+
+			if code, _, stderr := runCmd(f, "unset", tt.domain, tt.validation, "x"); code != 0 {
+				t.Fatalf("unset: exit code = %d, stderr = %q", code, stderr)
+			}
+			if f.rrsetCount() != 0 {
+				t.Errorf("%d RRSets left after unset, want 0", f.rrsetCount())
+			}
+			assertAllWaited(t, f)
+		})
+	}
+}
+
+// A transient failure of one of the zone lookups reruns the whole lookup.
+func TestZoneLookupRetry(t *testing.T) {
+	f := newFakeHetzner(t)
+	f.failWith("GET /zones/nas.example.com", failure{n: 1, status: 503, code: "service_error"})
+
+	code, _, stderr := runCmd(f, "set", "nas.example.com", "_acme-challenge.nas.example.com", "x")
+	if code != 0 || !strings.Contains(stderr, "Attempt 1 of 3 failed") || !strings.Contains(stderr, "failed to get zone nas.example.com") {
+		t.Errorf("exit code = %d, stderr = %q, want 0 after a retry of the zone lookup", code, stderr)
+	}
+	if got, ok := f.records("_acme-challenge.nas"); !ok || !slices.Equal(got, []string{`"x"`}) {
+		t.Errorf("records = %v (exists %v)", got, ok)
+	}
+}
+
+func TestTestCommandInSubdomainZone(t *testing.T) {
+	f := newFakeHetzner(t)
+	id := f.addZone("dev.example.com")
+
+	code, stdout, stderr := runCmd(f, "test", "nas.dev.example.com")
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr)
+	}
+	if !strings.Contains(stdout, "Found zone: dev.example.com") {
+		t.Errorf("stdout = %q, want the subdomain zone", stdout)
+	}
+	create := "POST /zones/" + strconv.FormatInt(id, 10) + "/rrsets"
+	if !f.called(create) {
+		t.Errorf("test record not created in dev.example.com, calls %v", f.calls)
 	}
 }
 
@@ -534,7 +626,8 @@ func TestTestCommand(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d, stderr = %q", code, stderr)
 	}
-	if !strings.Contains(stdout, "Looking up zone: example.com") || !strings.Contains(stdout, "Test passed!") {
+	if !strings.Contains(stdout, "Looking up zone for: nas.example.com") || !strings.Contains(stdout, "Found zone: example.com") ||
+		!strings.Contains(stdout, "Test passed!") {
 		t.Errorf("stdout = %q", stdout)
 	}
 	if _, ok := f.records(testRecordName); ok {
