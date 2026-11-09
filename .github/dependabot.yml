@@ -7,7 +7,9 @@ version: 2
 # ecosystem), which it creates itself.
 updates:
   - package-ecosystem: gomod
-    directory: /
+    # /tools pins govulncheck (a separate module, so its dependencies stay
+    # out of the binary's go.mod).
+    directories: [/, /tools]
     schedule:
       interval: monthly
       time: "06:00"
@@ -30,9 +32,10 @@ updates:
       time: "06:00"
       timezone: Etc/UTC
     open-pull-requests-limit: 5
+    # github-actions supports only default-days; semver-*-days is rejected
+    # for this ecosystem and stops all version updates.
     cooldown:
       default-days: 7
-      semver-major-days: 14
     commit-message:
       prefix: ci
       include: scope
