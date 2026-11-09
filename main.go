@@ -138,9 +138,19 @@ func recordValues(rrset *hcloud.ZoneRRSet) []string {
 	return values
 }
 
+// readToken returns the token without surrounding whitespace, so a file saved
+// with CRLF line endings or a trailing space still authenticates. An empty
+// file (the state right after init) fails here, before any API call.
 func readToken(path string) (string, error) {
 	out, err := os.ReadFile(path)
-	return strings.Trim(string(out), "\n"), err
+	if err != nil {
+		return "", err
+	}
+	token := strings.TrimSpace(string(out))
+	if token == "" {
+		return "", fmt.Errorf("token file %s is empty, put your Hetzner Cloud API token in it", path)
+	}
+	return token, nil
 }
 
 // checkTokenFile returns warnings about the ownership and mode of the token file.
@@ -157,8 +167,18 @@ func checkTokenFile(path string) ([]string, error) {
 	return warnings, nil
 }
 
+// clientOptions are the options every API client gets. The application name
+// puts "truenas-acme-hetzner/<Version>" in front of the hcloud-go User-Agent,
+// so Hetzner can tell this tool apart from other hcloud-go clients.
+func clientOptions(token string) []hcloud.ClientOption {
+	return []hcloud.ClientOption{
+		hcloud.WithToken(token),
+		hcloud.WithApplication("truenas-acme-hetzner", Version),
+	}
+}
+
 func newClient(token string) *hcloud.Client {
-	return hcloud.NewClient(hcloud.WithToken(token))
+	return hcloud.NewClient(clientOptions(token)...)
 }
 
 // connect reads the token, builds the API client and looks up the zone.
