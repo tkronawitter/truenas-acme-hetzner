@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -42,6 +43,7 @@ type fakeHetzner struct {
 	deletes      map[int64]bool      // running action IDs that delete their rrset
 	nextActionID int64
 	calls        []string                      // "METHOD /path" in order
+	userAgent    string                        // User-Agent header of the last request
 	failAt       map[string]int                // call -> occurrence (1-based) answered with an API error
 	hangOn       string                        // call whose first occurrence never answers until the client gives up
 	failActions  bool                          // polled actions finish with status error
@@ -86,12 +88,12 @@ func (f *fakeHetzner) app() (app, *bytes.Buffer, *bytes.Buffer) {
 		stderr:    stderr,
 		tokenPath: tokenPath,
 		newClient: func(token string) *hcloud.Client {
-			return hcloud.NewClient(
-				hcloud.WithToken(token),
+			// The production options first, so the fake sees the real User-Agent
+			return hcloud.NewClient(append(clientOptions(token),
 				hcloud.WithEndpoint(f.srv.URL),
 				hcloud.WithRetryOpts(hcloud.RetryOpts{MaxRetries: 0}),
 				hcloud.WithPollOpts(hcloud.PollOpts{BackoffFunc: hcloud.ConstantBackoff(time.Millisecond)}),
-			)
+			)...)
 		},
 		timeout: 10 * time.Second,
 	}, stdout, stderr
@@ -151,9 +153,13 @@ func (f *fakeHetzner) middleware(next http.Handler) http.Handler {
 		if got := r.Header.Get("Authorization"); got != "Bearer "+fakeToken {
 			f.t.Errorf("Authorization header = %q, want Bearer token from token file", got)
 		}
+		if want := "truenas-acme-hetzner/" + Version + " hcloud-go/"; !strings.HasPrefix(r.Header.Get("User-Agent"), want) {
+			f.t.Errorf("User-Agent header = %q, want prefix %q", r.Header.Get("User-Agent"), want)
+		}
 
 		call := r.Method + " " + r.URL.Path
 		f.mu.Lock()
+		f.userAgent = r.Header.Get("User-Agent")
 		f.calls = append(f.calls, call)
 		n := 0
 		for _, c := range f.calls {

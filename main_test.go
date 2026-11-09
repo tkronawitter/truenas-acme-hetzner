@@ -643,3 +643,102 @@ func TestInitFails(t *testing.T) {
 		t.Errorf("stderr = %q, want failed to create", stderr.String())
 	}
 }
+
+func TestReadTokenTrimsWhitespace(t *testing.T) {
+	tests := map[string]string{
+		"LF":                fakeToken + "\n",
+		"CRLF":              fakeToken + "\r\n",
+		"no newline":        fakeToken,
+		"spaces":            "  " + fakeToken + "  \n",
+		"tabs":              "\t" + fakeToken + "\t\r\n",
+		"trailing new line": fakeToken + "\n\n",
+	}
+
+	for name, content := range tests {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), ".tahtoken")
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			token, err := readToken(path)
+			if err != nil || token != fakeToken {
+				t.Errorf("readToken(%q) = %q, %v, want %q", content, token, err, fakeToken)
+			}
+		})
+	}
+}
+
+// A token file with CRLF line endings authenticates end to end; the fake
+// rejects any Authorization header other than the bare token.
+func TestSetWithCRLFToken(t *testing.T) {
+	f := newFakeHetzner(t)
+	a, _, stderr := f.app()
+	if err := os.WriteFile(a.tokenPath, []byte(fakeToken+"\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := run([]string{"tah", "set", "example.com", "_acme-challenge.example.com", "x"}, a); code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+}
+
+func TestEmptyToken(t *testing.T) {
+	commands := [][]string{
+		{"set", "example.com", "_acme-challenge.example.com", "x"},
+		{"unset", "example.com", "_acme-challenge.example.com", "x"},
+		{"test", "example.com"},
+	}
+	contents := map[string]string{
+		"empty":           "",
+		"only whitespace": " \t\r\n\n",
+	}
+
+	for _, args := range commands {
+		for name, content := range contents {
+			t.Run(args[0]+"/"+name, func(t *testing.T) {
+				f := newFakeHetzner(t)
+				a, _, stderr := f.app()
+				if err := os.WriteFile(a.tokenPath, []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+
+				if code := run(append([]string{"tah"}, args...), a); code != 1 {
+					t.Errorf("exit code = %d, want 1", code)
+				}
+				want := "token file " + a.tokenPath + " is empty, put your Hetzner Cloud API token in it"
+				if !strings.Contains(stderr.String(), want) {
+					t.Errorf("stderr = %q, want %q", stderr.String(), want)
+				}
+				f.mu.Lock()
+				calls := slices.Clone(f.calls)
+				f.mu.Unlock()
+				if len(calls) != 0 {
+					t.Errorf("API calls with an empty token: %v", calls)
+				}
+			})
+		}
+	}
+}
+
+func TestUserAgent(t *testing.T) {
+	old := Version
+	Version = "v9.9.9"
+	t.Cleanup(func() { Version = old })
+
+	f := newFakeHetzner(t)
+	if code, _, stderr := runCmd(f, "set", "example.com", "_acme-challenge.example.com", "x"); code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr)
+	}
+	f.mu.Lock()
+	got := f.userAgent
+	f.mu.Unlock()
+	if want := "truenas-acme-hetzner/v9.9.9 hcloud-go/"; !strings.HasPrefix(got, want) {
+		t.Errorf("User-Agent = %q, want prefix %q", got, want)
+	}
+}
+
+func TestNewClient(t *testing.T) {
+	if newClient(fakeToken) == nil {
+		t.Fatal("newClient returned nil")
+	}
+}
