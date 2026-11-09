@@ -563,8 +563,10 @@ func run(args []string, a app) int {
 	return 0
 }
 
-func main() {
-	os.Exit(run(os.Args, app{
+// defaultApp is the app the binary runs with: the real terminal, the token
+// file in $HOME, the Hetzner API and the production timeouts.
+func defaultApp() app {
+	return app{
 		stdout:      os.Stdout,
 		stderr:      os.Stderr,
 		tokenPath:   os.ExpandEnv("$HOME/.tahtoken"),
@@ -573,5 +575,9 @@ func main() {
 		retryBudget: retryBudget,
 		attempts:    retryAttempts,
 		retryDelay:  retryDelay,
-	}))
+	}
+}
+
+func main() {
+	os.Exit(run(os.Args, defaultApp()))
 }

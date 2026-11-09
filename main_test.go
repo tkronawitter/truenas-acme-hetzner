@@ -904,6 +904,27 @@ func TestRetryBudgetHangingRequest(t *testing.T) {
 	}
 }
 
+// The binary runs with the production limits, not with zero values that
+// would disable the retries or end every command at once.
+func TestDefaultApp(t *testing.T) {
+	t.Setenv("HOME", "/home/acme")
+	a := defaultApp()
+
+	if a.stdout != os.Stdout || a.stderr != os.Stderr {
+		t.Error("defaultApp must write to the terminal")
+	}
+	if want := "/home/acme/.tahtoken"; a.tokenPath != want {
+		t.Errorf("tokenPath = %q, want %q", a.tokenPath, want)
+	}
+	if a.newClient == nil {
+		t.Error("newClient is nil")
+	}
+	if a.timeout != apiTimeout || a.retryBudget != retryBudget || a.attempts != retryAttempts || a.retryDelay != retryDelay {
+		t.Errorf("timeout %s, retryBudget %s, attempts %d, retryDelay %s, want %s, %s, %d, %s",
+			a.timeout, a.retryBudget, a.attempts, a.retryDelay, apiTimeout, retryBudget, retryAttempts, retryDelay)
+	}
+}
+
 // The retries must end before tah's own timeout, which ends before the
 // TrueNAS Script Timeout, so the error comes from tah and not from a kill.
 func TestRetryBudgetFitsTimeout(t *testing.T) {
