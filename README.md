@@ -211,7 +211,7 @@ Run the tests with `go test ./...`. They use a local fake Hetzner API server and
 Dependabot checks Go modules and GitHub Actions once a month, on the 1st at 06:00 UTC. The policy lives in `.github/dependabot.yml`.
 
 - Minor and patch updates of one ecosystem arrive together in one pull request. Every major update gets its own pull request.
-- Dependabot waits 7 days after a release before proposing it, 14 days for a major release.
+- Dependabot waits after a release before proposing it. Go modules wait 7 days, 14 days for a major release. GitHub Actions always wait 7 days, because Dependabot has no separate major cooldown for that ecosystem.
 - Commit titles start with `deps` (Go modules) or `ci` (GitHub Actions).
 - The `sigstore/cosign-installer` major update stays ignored until the signing step in `release.yml` supports cosign v3 (#9).
 
