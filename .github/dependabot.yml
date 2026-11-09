@@ -7,7 +7,9 @@ version: 2
 # ecosystem), which it creates itself.
 updates:
   - package-ecosystem: gomod
-    directory: /
+    # /tools pins govulncheck (a separate module, so its dependencies stay
+    # out of the binary's go.mod).
+    directories: [/, /tools]
     schedule:
       interval: monthly
       time: "06:00"
