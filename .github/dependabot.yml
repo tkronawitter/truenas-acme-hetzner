@@ -39,6 +39,7 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
+        update-types: [minor, patch]
     ignore:
       # v4 installs cosign v3, which breaks the detached .sig/.pem signing step
       # in release.yml. Lift together with a sign-blob change (#9).
