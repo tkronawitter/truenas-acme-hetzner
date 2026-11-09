@@ -162,12 +162,37 @@ Exit code 0 means success, 1 means failure; TrueNAS only looks at the exit code.
 - **They retry temporary failures.** If Hetzner answers with a server error (5xx), a rate limit, a lock or conflict, or an "already exists" error, or if the connection fails, `set` and `unset` try again, up to 3 attempts within 40 seconds. Each retry prints `Attempt N of 3 failed, retrying in Xs: ...` to stderr. Authentication errors (401, 403), not found (404) and invalid input fail at once, because another try would not change the answer. `test` is not repeated.
 - **Timeout.** `set` and `unset` give up after 50 seconds, including the wait for Hetzner, and exit 1 with `timed out after 50s`. See Script Timeout under [TrueNAS Integration](#truenas-integration).
 
+### Which Zone Is Used
+
+`set` and `unset` write into the most specific zone in your Hetzner account that contains the `validation_name`. The `<domain>` argument is only checked for being a valid name and plays no part in the choice. tah tries the parent names of the `validation_name` one after the other, from the most specific one up to the registrable domain (for example `example.com` or `example.co.uk`), and takes the first one that exists as a zone in the account.
+
+With the zones `example.com` and `dev.example.com` in the account, `_acme-challenge.nas.dev.example.com` goes into `dev.example.com`, and `_acme-challenge.nas.example.com` goes into `example.com`.
+
+Because the zone follows the `validation_name`, the certificate's domain and the zone can differ. This is what a CNAME delegation of `_acme-challenge` into another zone of the same Hetzner account needs: when the `validation_name` lies in that other zone, tah writes there.
+
+tah prints the result for every `set` and `unset`:
+
+```
+Zone dev.example.com, record _acme-challenge.nas
+```
+
+If no candidate is a zone in the account, the command exits 1 with `no zone in the Hetzner account matches (tried ...)`, where the brackets list the names it tried, separated by commas. Either the token belongs to a different Hetzner project than the zone, or the zone does not exist in the account.
+
+**Known limit (#40).** tah only knows the zones in your Hetzner account. If a subdomain is delegated to another DNS provider and the account holds only the parent zone, tah writes into the parent zone, and the validation fails because the delegated name servers never see the record. tah does not detect this.
+
 ### Test Configuration (recommended)
 
 Run this as the Running User, after every change to the token or the user. It needs only a domain in your zone.
 
 ```bash
 sudo -u acme -H /mnt/pool/tah test nas.example.com
+```
+
+`test` looks for the zone of the domain you pass, then for its parent names, and reports what it found:
+
+```
+Looking up zone for: nas.example.com
+Found zone: example.com
 ```
 
 ### Check Version
