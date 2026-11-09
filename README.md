@@ -56,6 +56,8 @@ wget -O /mnt/pool/tah https://github.com/tkronawitter/truenas-acme-hetzner/relea
 chmod +x /mnt/pool/tah
 ```
 
+Store the binary on a dataset, as in these examples. TrueNAS mounts `/tmp` with `noexec`, so a binary placed there cannot be run.
+
 `releases/latest` always points to the latest stable release. Release candidates (tags like `v1.2.0-rc1`) are published as pre-releases and have to be picked by tag:
 
 ```bash
@@ -88,7 +90,7 @@ See [Hetzner docs on generating API tokens](https://docs.hetzner.com/cloud/api/g
 echo -n "YOUR_CLOUD_API_TOKEN" > $HOME/.tahtoken
 ```
 
-**Note:** File must contain only the token string, no trailing newline.
+**Note:** The file must contain only the token string. A trailing line feed is removed when the file is read, so an editor that adds one does no harm. Windows line endings (CRLF) are not removed and make the token invalid.
 
 ### 3. Migrate DNS Zone (if needed)
 
@@ -138,7 +140,7 @@ In TrueNAS UI: **Credentials → Certificates → ACME DNS-Authenticators**
 - Script Timeout: keep at least 60 seconds (the default)
 - Propagation Delay: see below
 
-**Running User.** TrueNAS runs the script as this user, and tah reads the token from that user's `$HOME/.tahtoken`. The default is `nobody`, which has no usable home directory, so the token file has nowhere to live. Do not keep the default:
+**Running User.** TrueNAS runs the script as this user and sets `$HOME` to that user's home directory, and tah reads the token from `$HOME/.tahtoken`. The default is `nobody`, which has no usable home directory, so the token file has nowhere to live. Do not keep the default:
 
 1. Pick or create a user that has a home directory.
 2. Log in as that user (or `su` to it) and run `tah init`, then store the token as described in [Store Token](#2-store-token).
