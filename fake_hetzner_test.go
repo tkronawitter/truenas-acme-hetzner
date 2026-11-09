@@ -51,17 +51,19 @@ type fakeHetzner struct {
 	hangOn       string                        // call whose first occurrence never answers until the client gives up
 	failActions  bool                          // polled actions finish with status error
 	lastCreate   schema.ZoneRRSetCreateRequest // body of the last create call
+	nameservers  map[string][]string           // zone name -> authoritative_nameservers.assigned
 }
 
 func newFakeHetzner(t *testing.T) *fakeHetzner {
 	t.Helper()
 	f := &fakeHetzner{
-		t:       t,
-		zones:   map[string]int64{fakeZone: fakeZoneID},
-		rrsets:  map[string][]string{},
-		running: map[int64]string{},
-		deletes: map[int64]bool{},
-		failAt:  map[string]failure{},
+		t:           t,
+		zones:       map[string]int64{fakeZone: fakeZoneID},
+		nameservers: map[string][]string{},
+		rrsets:      map[string][]string{},
+		running:     map[int64]string{},
+		deletes:     map[int64]bool{},
+		failAt:      map[string]failure{},
 	}
 
 	mux := http.NewServeMux()
@@ -102,6 +104,14 @@ func (f *fakeHetzner) app() (app, *bytes.Buffer, *bytes.Buffer) {
 		retryBudget: 10 * time.Second,
 		attempts:    retryAttempts,
 		retryDelay:  time.Millisecond,
+		ns: nsCheck{
+			lookup:       lookupTXTDirect,
+			maxWait:      2 * time.Second,
+			margin:       100 * time.Millisecond,
+			minWait:      50 * time.Millisecond,
+			interval:     10 * time.Millisecond,
+			queryTimeout: 500 * time.Millisecond,
+		},
 	}, stdout, stderr
 }
 
@@ -179,6 +189,19 @@ func (f *fakeHetzner) addZone(name string) int64 {
 	id := fakeZoneID + int64(len(f.zones))
 	f.zones[name] = id
 	return id
+}
+
+// setNameservers sets the assigned nameservers of example.com.
+func (f *fakeHetzner) setNameservers(ns ...string) {
+	f.setZoneNameservers(fakeZone, ns...)
+}
+
+// setZoneNameservers sets the assigned nameservers of a zone. Under the lock,
+// because the server goroutines already run and read them.
+func (f *fakeHetzner) setZoneNameservers(zone string, ns ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nameservers[zone] = ns
 }
 
 func rrsetKey(zoneID int64, name, typ string) string {
@@ -332,7 +355,14 @@ func (f *fakeHetzner) getZone(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "zone not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, schema.ZoneGetResponse{Zone: schema.Zone{ID: id, Name: name}})
+	f.mu.Lock()
+	ns := slices.Clone(f.nameservers[name])
+	f.mu.Unlock()
+	writeJSON(w, http.StatusOK, schema.ZoneGetResponse{Zone: schema.Zone{
+		ID:                       id,
+		Name:                     name,
+		AuthoritativeNameservers: schema.ZoneAuthoritativeNameservers{Assigned: ns},
+	}})
 }
 
 func (f *fakeHetzner) getRRSet(w http.ResponseWriter, r *http.Request) {
