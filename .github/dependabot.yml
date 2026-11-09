@@ -1,15 +1,47 @@
 version: 2
+# Policy: one grouped PR per ecosystem and month (1st of the month), majors
+# separate, a cooldown before new releases reach the signing workflow.
+# Updates collect on main and ship with the next feature release; only a
+# reachable govulncheck finding justifies a patch release of its own.
+# Labels are left to Dependabot's defaults ("dependencies" plus the
+# ecosystem), which it creates itself.
 updates:
   - package-ecosystem: gomod
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    commit-message:
+      prefix: deps
+      include: scope
+    groups:
+      gomod-minor-patch:
+        update-types: [minor, patch]
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      github-actions:
+        patterns: ["*"]
+        update-types: [minor, patch]
     ignore:
       # v4 installs cosign v3, which breaks the detached .sig/.pem signing step
-      # in release.yml. Lift together with a sign-blob change.
+      # in release.yml. Lift together with a sign-blob change (#9).
       - dependency-name: sigstore/cosign-installer
         update-types: ["version-update:semver-major"]
