@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"slices"
 	"strings"
@@ -27,6 +29,16 @@ const (
 	// below the default TrueNAS "Script Timeout" of 60s, so tah reports the
 	// timeout itself instead of being killed in the middle of a wait.
 	apiTimeout = 50 * time.Second
+	// retryBudget bounds set and unset including their retries. It leaves
+	// apiTimeout-retryBudget for the nameserver check planned in #21.
+	retryBudget = 40 * time.Second
+	// retryAttempts is how often set and unset run before tah gives up, and
+	// retryDelay the wait before the second run; it doubles after that.
+	retryAttempts = 3
+	retryDelay    = 1 * time.Second
+	// requestTimeout ends a single API request that hangs, so a stalled
+	// connection becomes a retry instead of using up the whole retryBudget.
+	requestTimeout = 15 * time.Second
 	// cleanupTimeout gives the test command's cleanup its own time budget,
 	// because it also has to run after apiTimeout has expired.
 	cleanupTimeout = 10 * time.Second
@@ -46,13 +58,17 @@ Command:
 `
 
 // app holds everything a command touches outside its arguments, so tests can
-// swap the output streams, the token file, the Hetzner API endpoint and the timeout.
+// swap the output streams, the token file, the Hetzner API endpoint, the
+// timeout and the retry settings.
 type app struct {
-	stdout    io.Writer
-	stderr    io.Writer
-	tokenPath string
-	newClient func(token string) *hcloud.Client
-	timeout   time.Duration
+	stdout      io.Writer
+	stderr      io.Writer
+	tokenPath   string
+	newClient   func(token string) *hcloud.Client
+	timeout     time.Duration
+	retryBudget time.Duration
+	attempts    int
+	retryDelay  time.Duration
 }
 
 // usageError marks invalid command line input; run prints the help hint after it.
@@ -170,10 +186,97 @@ func checkTokenFile(path string) ([]string, error) {
 // clientOptions are the options every API client gets. The application name
 // puts "truenas-acme-hetzner/<Version>" in front of the hcloud-go User-Agent,
 // so Hetzner can tell this tool apart from other hcloud-go clients.
+//
+// hcloud-go retries 502, 504, network timeouts and a few API error codes on
+// its own, by default 5 times with up to 60s backoff. That alone could use up
+// apiTimeout, and it would multiply with the command retries in withRetry, so
+// it is cut down to 2 quick retries per request.
 func clientOptions(token string) []hcloud.ClientOption {
 	return []hcloud.ClientOption{
 		hcloud.WithToken(token),
 		hcloud.WithApplication("truenas-acme-hetzner", Version),
+		hcloud.WithHTTPClient(&http.Client{Timeout: requestTimeout}),
+		hcloud.WithRetryOpts(hcloud.RetryOpts{
+			MaxRetries: 2,
+			BackoffFunc: hcloud.ExponentialBackoffWithOpts(hcloud.ExponentialBackoffOpts{
+				Base:       500 * time.Millisecond,
+				Multiplier: 2,
+				Cap:        2 * time.Second,
+				Jitter:     true,
+			}),
+		}),
+	}
+}
+
+// retryable reports whether err is worth running set or unset again: a server
+// side or network failure, a request that collided with another change
+// (conflict, locked, an RRSet that already exists), or rate limiting.
+// Authentication, not found and validation errors are final.
+func retryable(err error) bool {
+	var apiErr hcloud.Error
+	if errors.As(err, &apiErr) {
+		switch apiErr.Code { //nolint:exhaustive // every other code is final
+		case hcloud.ErrorCodeConflict,
+			hcloud.ErrorCodeLocked,
+			hcloud.ErrorCodeUniquenessError,
+			hcloud.ErrorCodeRateLimitExceeded,
+			hcloud.ErrorCodeTimeout,
+			hcloud.ErrorCodeServerError,
+			hcloud.ErrorCodeServiceError:
+			return true
+		}
+		resp := apiErr.Response()
+		return resp != nil && resp.StatusCode >= http.StatusInternalServerError
+	}
+	// A status code without an API error body comes from a proxy or load
+	// balancer in front of the API, not from the API itself.
+	if errors.Is(err, hcloud.ErrStatusCode) {
+		return true
+	}
+	// Connection refused or reset, a failed DNS lookup, a lost response
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+// withRetry runs op until it succeeds, fails with an error that is not
+// retryable, or runs out of attempts or of the retry budget. set and unset are
+// idempotent, so a rerun after a lost response finds the record in place, and
+// a rerun after "already exists" adds the value to the RRSet another run
+// created in the meantime.
+func (a app) withRetry(ctx context.Context, op func(context.Context) error) error {
+	retryCtx, cancel := context.WithTimeout(ctx, a.retryBudget)
+	defer cancel()
+
+	// giveUp returns err once the budget is used up. When the whole command
+	// timed out instead, run reports that.
+	giveUp := func(err error, attempts int) error {
+		if ctx.Err() != nil {
+			return err
+		}
+		return fmt.Errorf("%w (gave up after %s, attempts: %d)", err, a.retryBudget, attempts)
+	}
+
+	delay := a.retryDelay
+	for attempt := 1; ; attempt++ {
+		err := op(retryCtx)
+		switch {
+		case err == nil:
+			return nil
+		case retryCtx.Err() != nil:
+			return giveUp(err, attempt)
+		case !retryable(err):
+			return err
+		case attempt == a.attempts:
+			return fmt.Errorf("%w (after %d attempts)", err, attempt)
+		}
+
+		_, _ = fmt.Fprintf(a.stderr, "Attempt %d of %d failed, retrying in %s: %v\n", attempt, a.attempts, delay, err)
+		select {
+		case <-retryCtx.Done():
+			return giveUp(err, attempt)
+		case <-time.After(delay):
+		}
+		delay *= 2
 	}
 }
 
@@ -428,9 +531,9 @@ func run(args []string, a app) int {
 	} else {
 		switch args[1] {
 		case "set":
-			err = a.cmdSet(ctx, args)
+			err = a.withRetry(ctx, func(ctx context.Context) error { return a.cmdSet(ctx, args) })
 		case "unset":
-			err = a.cmdUnset(ctx, args)
+			err = a.withRetry(ctx, func(ctx context.Context) error { return a.cmdUnset(ctx, args) })
 		case "init":
 			err = a.cmdInit()
 		case "test":
@@ -462,10 +565,13 @@ func run(args []string, a app) int {
 
 func main() {
 	os.Exit(run(os.Args, app{
-		stdout:    os.Stdout,
-		stderr:    os.Stderr,
-		tokenPath: os.ExpandEnv("$HOME/.tahtoken"),
-		newClient: newClient,
-		timeout:   apiTimeout,
+		stdout:      os.Stdout,
+		stderr:      os.Stderr,
+		tokenPath:   os.ExpandEnv("$HOME/.tahtoken"),
+		newClient:   newClient,
+		timeout:     apiTimeout,
+		retryBudget: retryBudget,
+		attempts:    retryAttempts,
+		retryDelay:  retryDelay,
 	}))
 }

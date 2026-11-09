@@ -1,10 +1,12 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -741,4 +743,207 @@ func TestNewClient(t *testing.T) {
 	if newClient(fakeToken) == nil {
 		t.Fatal("newClient returned nil")
 	}
+}
+
+// Transient failures are retried from the GET, and the command ends as if
+// nothing had happened.
+func TestRetryTransientFailures(t *testing.T) {
+	const rrset = "/zones/42/rrsets/_acme-challenge/TXT"
+	tests := []struct {
+		name     string
+		existing []string
+		cmd      string
+		call     string
+		fail     failure
+		want     []string // records afterwards; nil means the RRSet is gone
+		// The rerun finds the change in place and does not know the action of
+		// the first attempt, so that action stays unpolled. The nameserver
+		// check of #21 covers a change that is not applied yet.
+		unwaited bool
+	}{
+		{"500 on rrset lookup", nil, "set", "GET " + rrset,
+			failure{n: 1, status: 500, code: "server_error"}, []string{`"x"`}, false},
+		{"503 without API body on create", nil, "set", "POST /zones/42/rrsets",
+			failure{n: 1, status: 503}, []string{`"x"`}, false},
+		{"connection reset on create", nil, "set", "POST /zones/42/rrsets",
+			failure{n: 1, drop: dropBefore}, []string{`"x"`}, false},
+		{"lost response after create", nil, "set", "POST /zones/42/rrsets",
+			failure{n: 1, drop: dropAfter}, []string{`"x"`}, true},
+		{"502 on wait for add", []string{`"other"`}, "set", "GET /actions",
+			failure{n: 1, status: 502}, []string{`"other"`, `"x"`}, true},
+		{"rate limit on add", []string{`"other"`}, "set", "POST " + rrset + "/actions/add_records",
+			failure{n: 1, status: 429, code: "rate_limit_exceeded"}, []string{`"other"`, `"x"`}, false},
+		{"503 on remove", []string{`"x"`, `"other"`}, "unset", "POST " + rrset + "/actions/remove_records",
+			failure{n: 1, status: 503, code: "service_error"}, []string{`"other"`}, false},
+		{"connection reset on delete", []string{`"x"`}, "unset", "DELETE " + rrset,
+			failure{n: 1, drop: dropBefore}, nil, false},
+		{"lost response after delete", []string{`"x"`}, "unset", "DELETE " + rrset,
+			failure{n: 1, drop: dropAfter}, nil, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakeHetzner(t)
+			if tt.existing != nil {
+				f.addRecords("_acme-challenge", tt.existing...)
+			}
+			f.failWith(tt.call, tt.fail)
+
+			code, _, stderr := runCmd(f, tt.cmd, "example.com", "_acme-challenge.example.com", "x")
+			if code != 0 {
+				t.Fatalf("exit code = %d, stderr = %q, want 0 after a retry", code, stderr)
+			}
+			if !strings.Contains(stderr, "Attempt 1 of 3 failed") {
+				t.Errorf("stderr = %q, want the failed first attempt", stderr)
+			}
+			got, ok := f.records("_acme-challenge")
+			if tt.want == nil && ok {
+				t.Errorf("RRSet still exists with %v", got)
+			}
+			if tt.want != nil && !slices.Equal(got, tt.want) {
+				t.Errorf("records = %v, want %v", got, tt.want)
+			}
+			if !tt.unwaited {
+				assertAllWaited(t, f)
+			}
+		})
+	}
+}
+
+// Authentication, not found and validation errors are final.
+func TestNotRetried(t *testing.T) {
+	const rrset = "/zones/42/rrsets/_acme-challenge/TXT"
+	tests := []struct {
+		name     string
+		existing []string
+		cmd      string
+		call     string
+		fail     failure
+	}{
+		{"401 on zone lookup", nil, "set", "GET /zones/example.com",
+			failure{status: 401, code: "unauthorized"}},
+		{"403 on create", nil, "set", "POST /zones/42/rrsets",
+			failure{status: 403, code: "forbidden"}},
+		{"404 on delete", []string{`"x"`}, "unset", "DELETE " + rrset,
+			failure{status: 404, code: "not_found"}},
+		{"422 on add", []string{`"other"`}, "set", "POST " + rrset + "/actions/add_records",
+			failure{status: 422, code: "invalid_input"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakeHetzner(t)
+			if tt.existing != nil {
+				f.addRecords("_acme-challenge", tt.existing...)
+			}
+			f.failWith(tt.call, tt.fail)
+
+			code, _, stderr := runCmd(f, tt.cmd, "example.com", "_acme-challenge.example.com", "x")
+			if code != 1 {
+				t.Errorf("exit code = %d, want 1", code)
+			}
+			if n := f.count(tt.call); n != 1 {
+				t.Errorf("%s was called %d times, want 1", tt.call, n)
+			}
+			if strings.Contains(stderr, "Attempt") {
+				t.Errorf("stderr = %q, want no retry", stderr)
+			}
+		})
+	}
+}
+
+func TestRetryGivesUpAfterAllAttempts(t *testing.T) {
+	const call = "GET /zones/42/rrsets/_acme-challenge/TXT"
+	f := newFakeHetzner(t)
+	f.failWith(call, failure{status: 503, code: "service_error"})
+
+	code, _, stderr := runCmd(f, "set", "example.com", "_acme-challenge.example.com", "x")
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if n := f.count(call); n != retryAttempts {
+		t.Errorf("%s was called %d times, want %d", call, n, retryAttempts)
+	}
+	if want := "failed to get RRSet: "; !strings.Contains(stderr, want) || !strings.HasSuffix(strings.TrimSpace(stderr), "(after 3 attempts)") {
+		t.Errorf("stderr = %q, want %q and the attempt count", stderr, want)
+	}
+}
+
+// An API that keeps failing must not hold the command past the retry budget,
+// even when the backoff would wait longer.
+func TestRetryBudget(t *testing.T) {
+	f := newFakeHetzner(t)
+	f.failWith("GET /zones/example.com", failure{status: 503})
+	a, _, stderr := f.app()
+	a.retryBudget = 50 * time.Millisecond
+	a.retryDelay = time.Hour
+
+	start := time.Now()
+	code := run([]string{"tah", "set", "example.com", "_acme-challenge.example.com", "x"}, a)
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("command took %s, want it to stop at the retry budget", elapsed)
+	}
+	if code != 1 || !strings.Contains(stderr.String(), "gave up after 50ms, attempts: 1") {
+		t.Errorf("exit code = %d, stderr = %q, want 1 and the used up retry budget", code, stderr.String())
+	}
+}
+
+// A request that hangs uses up the retry budget, not tah's whole timeout.
+func TestRetryBudgetHangingRequest(t *testing.T) {
+	f := newFakeHetzner(t)
+	f.hangOn = "GET /zones/example.com"
+	a, _, stderr := f.app()
+	a.retryBudget = 50 * time.Millisecond
+
+	code := run([]string{"tah", "unset", "example.com", "_acme-challenge.example.com", "x"}, a)
+	if code != 1 || !strings.Contains(stderr.String(), "gave up after 50ms, attempts: 1") {
+		t.Errorf("exit code = %d, stderr = %q, want 1 and the used up retry budget", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "timed out after") {
+		t.Errorf("stderr = %q, the retry budget must end before the command timeout", stderr.String())
+	}
+}
+
+// The retries must end before tah's own timeout, which ends before the
+// TrueNAS Script Timeout, so the error comes from tah and not from a kill.
+func TestRetryBudgetFitsTimeout(t *testing.T) {
+	// Worst case of the backoff between the command attempts alone
+	var backoff time.Duration
+	for i := range retryAttempts - 1 {
+		backoff += retryDelay << i
+	}
+	if retryBudget >= apiTimeout || backoff >= retryBudget {
+		t.Errorf("retryBudget %s, backoff %s, apiTimeout %s: want backoff < retryBudget < apiTimeout", retryBudget, backoff, apiTimeout)
+	}
+}
+
+// Two certificate jobs for the same name: both see no RRSet, one create loses
+// with "already exists" and is rerun, then adds its value to the other's RRSet.
+func TestConcurrentSetSameName(t *testing.T) {
+	f := newFakeHetzner(t)
+	values := []string{"first", "second"}
+
+	var wg sync.WaitGroup
+	results := make([]string, len(values))
+	for i, v := range values {
+		a, _, stderr := f.app()
+		wg.Go(func() {
+			if code := run([]string{"tah", "set", "example.com", "_acme-challenge.example.com", v}, a); code != 0 {
+				results[i] = fmt.Sprintf("set %s: exit code %d, stderr %q", v, code, stderr.String())
+			}
+		})
+	}
+	wg.Wait()
+
+	for _, r := range results {
+		if r != "" {
+			t.Error(r)
+		}
+	}
+	got, _ := f.records("_acme-challenge")
+	slices.Sort(got)
+	if want := []string{`"first"`, `"second"`}; !slices.Equal(got, want) {
+		t.Errorf("records = %v, want %v", got, want)
+	}
+	assertAllWaited(t, f)
 }
