@@ -30,9 +30,10 @@ updates:
       time: "06:00"
       timezone: Etc/UTC
     open-pull-requests-limit: 5
+    # github-actions supports only default-days; semver-*-days is rejected
+    # for this ecosystem and stops all version updates.
     cooldown:
       default-days: 7
-      semver-major-days: 14
     commit-message:
       prefix: ci
       include: scope
