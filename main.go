@@ -222,7 +222,7 @@ func (a app) cmdSet(ctx context.Context, args []string) error {
 		result, _, err := client.Zone.CreateRRSet(ctx, zone, hcloud.ZoneRRSetCreateOpts{
 			Name:    name,
 			Type:    hcloud.ZoneRRSetTypeTXT,
-			TTL:     hcloud.Ptr(txtTTL),
+			TTL:     new(txtTTL),
 			Records: records,
 		})
 		if err != nil {
@@ -352,7 +352,7 @@ func (a app) cmdTest(ctx context.Context, args []string) (err error) {
 	result, _, err := client.Zone.CreateRRSet(ctx, zone, hcloud.ZoneRRSetCreateOpts{
 		Name:    testRecordName,
 		Type:    hcloud.ZoneRRSetTypeTXT,
-		TTL:     hcloud.Ptr(txtTTL),
+		TTL:     new(txtTTL),
 		Records: []hcloud.ZoneRRSetRecord{{Value: quotedValue}},
 	})
 	if err != nil {
