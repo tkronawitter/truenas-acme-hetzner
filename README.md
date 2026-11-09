@@ -132,7 +132,7 @@ sudo -u acme -H /mnt/pool/tah test nas.example.com
 
 The user must be able to read and execute the binary. If you switch to the user in some other way, make sure `$HOME` points to its home directory.
 
-**Note:** The file must contain only the token string. Line feeds at the start and end are removed when the file is read, so an editor that adds one does no harm. Windows line endings (CRLF) are not removed and make the token invalid.
+**Note:** The file must contain only the token string. Spaces, tabs and line endings at the start and end are removed when the file is read, so an editor that adds a line feed or Windows line ending (CRLF) does no harm. An empty file stops with `token file <path> is empty, put your Hetzner Cloud API token in it`.
 
 ## Usage
 
