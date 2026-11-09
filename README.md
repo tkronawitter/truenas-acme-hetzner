@@ -9,6 +9,7 @@
 [![codecov](https://codecov.io/gh/tkronawitter/truenas-acme-hetzner/branch/main/graph/badge.svg)](https://codecov.io/gh/tkronawitter/truenas-acme-hetzner)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/tkronawitter/truenas-acme-hetzner)](go.mod)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Signed with Sigstore](https://img.shields.io/badge/signed-sigstore%2Fcosign-blue)](#verify-the-download-optional)
 
 ## Why This Fork?
 
