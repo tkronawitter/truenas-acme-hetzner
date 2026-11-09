@@ -206,7 +206,7 @@ func (f *fakeHetzner) rrsetSchema(name, typ string) schema.ZoneRRSet {
 		ID:   name + "/" + typ,
 		Name: name,
 		Type: typ,
-		TTL:  hcloud.Ptr(txtTTL),
+		TTL:  new(txtTTL),
 		Zone: fakeZoneID,
 	}
 	for _, v := range f.rrsets[name+"/"+typ] {
