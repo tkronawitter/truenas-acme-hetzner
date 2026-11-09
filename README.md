@@ -63,10 +63,10 @@ wget -O /mnt/pool/tah https://github.com/tkronawitter/truenas-acme-hetzner/relea
 chmod +x /mnt/pool/tah
 ```
 
-`releases/latest` always points to the latest stable release. Release candidates (tags like `v1.2.0-rc1`) are pre-releases and are only reachable by tag. To test one, replace the tag in this command (it overwrites the installed binary):
+`releases/latest` always points to the latest stable release. A release candidate (a tag like `vX.Y.Z-rcN`) is published as a pre-release while it is being tested and is only reachable by tag. Its release page is removed once the stable release is out. To test one, replace the tag in this command (it overwrites the installed binary):
 
 ```bash
-wget -O /mnt/pool/tah https://github.com/tkronawitter/truenas-acme-hetzner/releases/download/v1.2.0-rc1/tah-linux-amd64
+wget -O /mnt/pool/tah https://github.com/tkronawitter/truenas-acme-hetzner/releases/download/vX.Y.Z-rcN/tah-linux-amd64
 ```
 
 ### Verify the Download (optional)
@@ -159,6 +159,7 @@ Exit code 0 means success, 1 means failure; TrueNAS only looks at the exit code.
 - **They are safe to repeat.** `set` with a value that is already there changes nothing and exits 0. `unset` exits 0 when the value or the whole record set is already gone, so a repeated cleanup does not fail the certificate job.
 - **Several values per name work.** A certificate for `example.com` and `*.example.com` puts two values under `_acme-challenge.example.com`. Both are kept until each is removed. Removing the last value deletes the record set.
 - **Short TTL.** Record sets that tah creates get a TTL of 60 seconds (an existing record set keeps its TTL), so a retry soon after a failed validation is not answered with an old cached value.
+- **They retry temporary failures.** If Hetzner answers with a server error (5xx), a rate limit, a lock or conflict, or an "already exists" error, or if the connection fails, `set` and `unset` try again, up to 3 attempts within 40 seconds. Each retry prints `Attempt N of 3 failed, retrying in Xs: ...` to stderr. Authentication errors (401, 403), not found (404) and invalid input fail at once, because another try would not change the answer. `test` is not repeated.
 - **Timeout.** `set` and `unset` give up after 50 seconds, including the wait for Hetzner, and exit 1 with `timed out after 50s`. See Script Timeout under [TrueNAS Integration](#truenas-integration).
 
 ### Test Configuration (recommended)
@@ -233,6 +234,8 @@ gh api -X PUT repos/tkronawitter/truenas-acme-hetzner/automated-security-fixes
 ```
 
 To switch them off again, send `-X DELETE` to the same URLs.
+
+**Forks.** In a fork, Dependabot version updates are off until you switch them on under **Insights**, **Dependency graph**, **Dependabot**, with **Enable Dependabot**. This cannot be done through the API. Until then Dependabot does not run, even with a valid `.github/dependabot.yml`.
 
 ## References
 

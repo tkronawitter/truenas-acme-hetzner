@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -44,7 +45,7 @@ type fakeHetzner struct {
 	nextActionID int64
 	calls        []string                      // "METHOD /path" in order
 	userAgent    string                        // User-Agent header of the last request
-	failAt       map[string]int                // call -> occurrence (1-based) answered with an API error
+	failAt       map[string]failure            // call -> how one occurrence of it fails
 	hangOn       string                        // call whose first occurrence never answers until the client gives up
 	failActions  bool                          // polled actions finish with status error
 	lastCreate   schema.ZoneRRSetCreateRequest // body of the last create call
@@ -57,7 +58,7 @@ func newFakeHetzner(t *testing.T) *fakeHetzner {
 		rrsets:  map[string][]string{},
 		running: map[int64]string{},
 		deletes: map[int64]bool{},
-		failAt:  map[string]int{},
+		failAt:  map[string]failure{},
 	}
 
 	zone := "/zones/" + strconv.Itoa(fakeZoneID)
@@ -95,9 +96,32 @@ func (f *fakeHetzner) app() (app, *bytes.Buffer, *bytes.Buffer) {
 				hcloud.WithPollOpts(hcloud.PollOpts{BackoffFunc: hcloud.ConstantBackoff(time.Millisecond)}),
 			)...)
 		},
-		timeout: 10 * time.Second,
+		timeout:     10 * time.Second,
+		retryBudget: 10 * time.Second,
+		attempts:    retryAttempts,
+		retryDelay:  time.Millisecond,
 	}, stdout, stderr
 }
+
+// failure describes how the n-th occurrence (1-based) of a call fails, or
+// every occurrence for n == 0.
+type failure struct {
+	n      int
+	status int    // HTTP status of the answer
+	code   string // API error code; empty answers with a plain text body
+	drop   drop   // instead of an answer, the connection is reset
+}
+
+type drop int
+
+const (
+	// dropBefore resets the connection before the request is handled. The
+	// zero value answers normally.
+	dropBefore drop = iota + 1
+	// dropAfter handles the request, then resets the connection instead of
+	// answering, as when a response is lost on the way back.
+	dropAfter
+)
 
 // unfinished returns the IDs of actions no client has waited for.
 func (f *fakeHetzner) unfinished() []int64 {
@@ -121,11 +145,29 @@ func (f *fakeHetzner) locked(key string) bool {
 	return false
 }
 
-// failOn makes the n-th occurrence of call (e.g. "DELETE /zones/42/rrsets/x/TXT") fail.
+// failOn makes the n-th occurrence of call (e.g. "DELETE /zones/42/rrsets/x/TXT")
+// fail with a validation error, which is final.
 func (f *fakeHetzner) failOn(call string, n int) {
+	f.failWith(call, failure{n: n, status: http.StatusUnprocessableEntity, code: "invalid_input"})
+}
+
+func (f *fakeHetzner) failWith(call string, fl failure) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.failAt[call] = n
+	f.failAt[call] = fl
+}
+
+// count returns how often call was made.
+func (f *fakeHetzner) count(call string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		if c == call {
+			n++
+		}
+	}
+	return n
 }
 
 func (f *fakeHetzner) addRecords(name string, values ...string) {
@@ -167,20 +209,40 @@ func (f *fakeHetzner) middleware(next http.Handler) http.Handler {
 				n++
 			}
 		}
-		fail := f.failAt[call] == n
+		fl, fail := f.failAt[call]
+		fail = fail && (fl.n == n || fl.n == 0)
 		hang := f.hangOn == call && n == 1
 		f.mu.Unlock()
 
-		if hang {
+		switch {
+		case hang:
 			<-r.Context().Done()
-			return
+		case fail && fl.drop == dropBefore:
+			f.reset(w)
+		case fail && fl.drop == dropAfter:
+			next.ServeHTTP(httptest.NewRecorder(), r)
+			f.reset(w)
+		case fail && fl.code == "":
+			http.Error(w, "injected failure", fl.status)
+		case fail:
+			writeError(w, fl.status, fl.code, "injected failure")
+		default:
+			next.ServeHTTP(w, r)
 		}
-		if fail {
-			writeError(w, http.StatusUnprocessableEntity, "invalid_input", "injected failure")
-			return
-		}
-		next.ServeHTTP(w, r)
 	})
+}
+
+// reset closes the connection of w with a TCP reset and without an answer.
+func (f *fakeHetzner) reset(w http.ResponseWriter) {
+	conn, _, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		f.t.Errorf("hijack: %v", err)
+		return
+	}
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetLinger(0)
+	}
+	_ = conn.Close()
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
