@@ -204,6 +204,36 @@ Without `-ldflags`, `tah --version` prints `dev`.
 
 Run the tests with `go test ./...`. They use a local fake Hetzner API server and need no token or internet access.
 
+## Maintenance
+
+### Dependency Updates
+
+Dependabot checks Go modules and GitHub Actions once a month, on the 1st at 06:00 UTC. The policy lives in `.github/dependabot.yml`.
+
+- Minor and patch updates of one ecosystem arrive together in one pull request. Every major update gets its own pull request.
+- Dependabot waits 7 days after a release before proposing it, 14 days for a major release.
+- Commit titles start with `deps` (Go modules) or `ci` (GitHub Actions).
+- The `sigstore/cosign-installer` major update stays ignored until the signing step in `release.yml` supports cosign v3 (#9).
+
+**Monthly routine**
+
+1. Dependabot opens the pull requests.
+2. Wait for CI to pass.
+3. Merge each pull request by hand. There is no auto-merge.
+
+**Releases.** Dependency updates collect on `main` and ship with the next feature release. An update to GitHub Actions never triggers a release. A patch release outside the schedule happens only when `govulncheck` reports a vulnerability that the binary can reach. The TrueNAS test runs once per release, not once per Dependabot pull request.
+
+### Repository Settings
+
+The two settings below enable Dependabot alerts and security updates. They are repository settings, not part of any file in the repository. Run them once with the GitHub CLI:
+
+```bash
+gh api -X PUT repos/tkronawitter/truenas-acme-hetzner/vulnerability-alerts
+gh api -X PUT repos/tkronawitter/truenas-acme-hetzner/automated-security-fixes
+```
+
+To switch them off again, send `-X DELETE` to the same URLs.
+
 ## References
 
 - [Hetzner DNS Migration Docs](https://docs.hetzner.com/networking/dns/migration-to-hetzner-console/process/)
