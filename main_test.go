@@ -25,15 +25,15 @@ func TestRunUsageErrors(t *testing.T) {
 		args    []string
 		wantErr string
 	}{
-		{"no command", nil, "Command is missing!"},
-		{"invalid command", []string{"delete"}, "Invalid command: delete!"},
-		{"-v is not a version alias", []string{"-v"}, "Invalid command: -v!"},
-		{"set without domain", []string{"set"}, "domain is missing!"},
-		{"set without validation_name", []string{"set", "example.com"}, "validation_name is missing!"},
-		{"set without validation_context", []string{"set", "example.com", "_acme-challenge.example.com"}, "validation_context is missing!"},
-		{"unset without validation_context", []string{"unset", "example.com", "_acme-challenge.example.com"}, "validation_context is missing!"},
-		{"test without domain", []string{"test"}, "domain is missing!"},
-		{"domain without public suffix", []string{"test", "localhost"}, "Invalid domain: localhost!"},
+		{"no command", nil, "command is missing"},
+		{"invalid command", []string{"delete"}, "invalid command: delete"},
+		{"-v is not a version alias", []string{"-v"}, "invalid command: -v"},
+		{"set without domain", []string{"set"}, "domain is missing"},
+		{"set without validation_name", []string{"set", "example.com"}, "validation_name is missing"},
+		{"set without validation_context", []string{"set", "example.com", "_acme-challenge.example.com"}, "validation_context is missing"},
+		{"unset without validation_context", []string{"unset", "example.com", "_acme-challenge.example.com"}, "validation_context is missing"},
+		{"test without domain", []string{"test"}, "domain is missing"},
+		{"domain without public suffix", []string{"test", "localhost"}, "invalid domain: localhost"},
 	}
 
 	for _, tt := range tests {
@@ -43,10 +43,10 @@ func TestRunUsageErrors(t *testing.T) {
 			if code != 1 {
 				t.Errorf("exit code = %d, want 1", code)
 			}
-			if !strings.Contains(stderr, tt.wantErr) {
-				t.Errorf("stderr = %q, want it to contain %q", stderr, tt.wantErr)
+			if stderr != tt.wantErr+"\n" {
+				t.Errorf("stderr = %q, want %q", stderr, tt.wantErr+"\n")
 			}
-			if !strings.Contains(stdout, `Use "tah help" for help!`) {
+			if stdout != "Use \"tah help\" for help\n" {
 				t.Errorf("stdout = %q, want the help hint", stdout)
 			}
 			if len(f.calls) != 0 {
@@ -341,7 +341,7 @@ func TestInvalidValidationName(t *testing.T) {
 			t.Run(cmd+" "+name, func(t *testing.T) {
 				f := newFakeHetzner(t)
 				code, stdout, stderr := runCmd(f, cmd, "example.com", name, "x")
-				if code != 1 || !strings.Contains(stderr, "Invalid validation_name: "+name+"!") || !strings.Contains(stdout, "help") {
+				if code != 1 || !strings.Contains(stderr, "invalid validation_name: "+name) || !strings.Contains(stdout, "help") {
 					t.Errorf("exit code = %d, stderr = %q, want 1 and the usage error", code, stderr)
 				}
 				f.mu.Lock()
