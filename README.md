@@ -71,7 +71,22 @@ wget -O /mnt/pool/tah https://github.com/tkronawitter/truenas-acme-hetzner/relea
 
 ### Verify the Download (optional)
 
-Each release carries a Sigstore signature (`tah-linux-amd64.sig`) and certificate (`tah-linux-amd64.pem`) created by the release workflow. To check the binary with [cosign](https://github.com/sigstore/cosign), set `VERSION` to the release tag, download the binary and both files into one directory, and run the check there. Run it on any machine that has cosign; the check does not need to run on the NAS, and you can copy the binary to the NAS afterwards.
+Releases from v1.3.0-rc1 on carry a Sigstore bundle (`tah-linux-amd64.sigstore.json`) created by the release workflow. It holds the signature, the signing certificate and the transparency log proof in one file, so the check works offline. You need [cosign](https://github.com/sigstore/cosign) 3.x or newer. Set `VERSION` to the release tag, download the binary and the bundle into one directory, and run the check there. Run it on any machine that has cosign; the check does not need to run on the NAS, and you can copy the binary to the NAS afterwards.
+
+```bash
+VERSION=v1.3.0
+wget https://github.com/tkronawitter/truenas-acme-hetzner/releases/download/${VERSION}/tah-linux-amd64
+wget https://github.com/tkronawitter/truenas-acme-hetzner/releases/download/${VERSION}/tah-linux-amd64.sigstore.json
+cosign verify-blob \
+  --bundle tah-linux-amd64.sigstore.json \
+  --certificate-identity "https://github.com/tkronawitter/truenas-acme-hetzner/.github/workflows/release.yml@refs/tags/${VERSION}" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  tah-linux-amd64
+```
+
+Expected output: `Verified OK`. The release workflow runs the same check before it publishes anything.
+
+**Older releases (v1.2.0 and earlier)** carry a detached signature (`tah-linux-amd64.sig`) and certificate (`tah-linux-amd64.pem`) instead of the bundle. The first releases with a bundle (up to and including v1.3.0) still publish both forms; the release after v1.3.0 drops the detached files. For a release that has them:
 
 ```bash
 VERSION=v1.2.0
@@ -246,7 +261,7 @@ Dependabot checks Go modules and GitHub Actions once a month, on the 1st at 06:0
 - Minor and patch updates of one ecosystem arrive together in one pull request. Every major update gets its own pull request.
 - Dependabot waits after a release before proposing it. Go modules wait 7 days, 14 days for a major release. GitHub Actions always wait 7 days, because Dependabot has no separate major cooldown for that ecosystem.
 - Commit titles start with `deps` (Go modules) or `ci` (GitHub Actions).
-- The `sigstore/cosign-installer` major update stays ignored until the signing step in `release.yml` supports cosign v3 (#9).
+- `sigstore/cosign-installer` updates arrive like other GitHub Actions. The action's version fixes the cosign version used for signing, so a bump moves both together.
 
 **Monthly routine**
 
