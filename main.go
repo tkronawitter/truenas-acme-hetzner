@@ -134,11 +134,31 @@ func recordArgs(args []string) (name string, candidates []string, value string, 
 	if len(args) < 5 {
 		return "", nil, "", usageError{"validation_context is missing!"}
 	}
-	candidates, ok := zoneCandidates(args[3], false)
-	if !ok || len(candidates) == 0 {
+	name = strings.ToLower(strings.TrimSuffix(args[3], "."))
+	candidates, ok := zoneCandidates(name, false)
+	if !ok || len(candidates) == 0 || !hostLabels(name) {
 		return "", nil, "", usageError{fmt.Sprintf("Invalid validation_name: %s!", args[3])}
 	}
-	return strings.ToLower(strings.TrimSuffix(args[3], ".")), candidates, args[4], nil
+	return name, candidates, args[4], nil
+}
+
+// hostLabels reports whether every label of name is non-empty and consists
+// only of a-z, 0-9, _ and -. hcloud-go puts the name into the API path
+// unescaped, so a / ? or # would change the request and could make unset
+// delete a record other than the TXT challenge (#49). Challenge names from
+// TrueNAS are lower case, IDNs arrive as xn-- labels.
+func hostLabels(name string) bool {
+	for label := range strings.SplitSeq(name, ".") {
+		if label == "" {
+			return false
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' && r != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // rrsetName returns name relative to zone, e.g. "_acme-challenge.nas" for

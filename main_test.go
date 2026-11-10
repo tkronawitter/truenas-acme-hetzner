@@ -322,17 +322,46 @@ func TestZoneCandidates(t *testing.T) {
 }
 
 func TestInvalidValidationName(t *testing.T) {
-	for _, name := range []string{"example.com", "com", "localhost"} {
-		t.Run(name, func(t *testing.T) {
-			f := newFakeHetzner(t)
-			code, stdout, stderr := runCmd(f, "set", "example.com", name, "x")
-			if code != 1 || !strings.Contains(stderr, "Invalid validation_name: "+name+"!") || !strings.Contains(stdout, "help") {
-				t.Errorf("exit code = %d, stderr = %q, want 1 and the usage error", code, stderr)
-			}
-			if f.count("GET /zones/example.com") != 0 {
-				t.Error("an invalid validation_name must not reach the API")
-			}
-		})
+	names := []string{
+		"example.com", "com", "localhost",
+		// Characters that would change the unescaped API path (#49)
+		"_acme-challenge.www/A#.example.com",
+		"_acme-challenge.www?x.example.com",
+		"_acme-challenge#.example.com",
+		"_acme challenge.example.com",
+		"_acme-challenge..example.com",
+	}
+	for _, cmd := range []string{"set", "unset"} {
+		for _, name := range names {
+			t.Run(cmd+" "+name, func(t *testing.T) {
+				f := newFakeHetzner(t)
+				code, stdout, stderr := runCmd(f, cmd, "example.com", name, "x")
+				if code != 1 || !strings.Contains(stderr, "Invalid validation_name: "+name+"!") || !strings.Contains(stdout, "help") {
+					t.Errorf("exit code = %d, stderr = %q, want 1 and the usage error", code, stderr)
+				}
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				if len(f.calls) != 0 {
+					t.Errorf("API calls %v, want none for an invalid validation_name", f.calls)
+				}
+			})
+		}
+	}
+}
+
+// Upper case, a trailing dot, digits, - and _ are valid in a validation_name.
+func TestHostLabels(t *testing.T) {
+	for _, name := range []string{"_acme-challenge.nas-01.example.com", "_acme-challenge.xn--bcher-kva.example"} {
+		if !hostLabels(name) {
+			t.Errorf("hostLabels(%q) = false, want true", name)
+		}
+	}
+	f := newFakeHetzner(t)
+	if code, _, stderr := runCmd(f, "set", "example.com", "_ACME-Challenge.Example.COM.", "x"); code != 0 {
+		t.Errorf("exit code = %d, stderr = %q, want 0 for upper case and a trailing dot", code, stderr)
+	}
+	if _, ok := f.records("_acme-challenge"); !ok {
+		t.Error("record _acme-challenge not created")
 	}
 }
 
