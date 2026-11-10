@@ -119,11 +119,11 @@ func zoneCandidates(name string, self bool) (candidates []string, ok bool) {
 // validation_name, which may lie in another zone (CNAME delegation).
 func domainArg(args []string) ([]string, error) {
 	if len(args) < 3 {
-		return nil, usageError{"domain is missing!"}
+		return nil, usageError{"domain is missing"}
 	}
 	candidates, ok := zoneCandidates(args[2], true)
 	if !ok {
-		return nil, usageError{fmt.Sprintf("Invalid domain: %s!", args[2])}
+		return nil, usageError{fmt.Sprintf("invalid domain: %s", args[2])}
 	}
 	return candidates, nil
 }
@@ -137,15 +137,15 @@ func recordArgs(args []string) (name string, candidates []string, value string, 
 		return "", nil, "", err
 	}
 	if len(args) < 4 {
-		return "", nil, "", usageError{"validation_name is missing!"}
+		return "", nil, "", usageError{"validation_name is missing"}
 	}
 	if len(args) < 5 {
-		return "", nil, "", usageError{"validation_context is missing!"}
+		return "", nil, "", usageError{"validation_context is missing"}
 	}
 	name = strings.ToLower(strings.TrimSuffix(args[3], "."))
 	candidates, ok := zoneCandidates(name, false)
 	if !ok || len(candidates) == 0 || !hostLabels(name) {
-		return "", nil, "", usageError{fmt.Sprintf("Invalid validation_name: %s!", args[3])}
+		return "", nil, "", usageError{fmt.Sprintf("invalid validation_name: %s", args[3])}
 	}
 	return name, candidates, args[4], nil
 }
@@ -602,7 +602,7 @@ func run(args []string, a app) int {
 
 	var err error
 	if len(args) < 2 {
-		err = usageError{"Command is missing!"}
+		err = usageError{"command is missing"}
 	} else {
 		switch args[1] {
 		case "set":
@@ -629,7 +629,7 @@ func run(args []string, a app) int {
 		case "help":
 			a.printf(helpText, prog)
 		default:
-			err = usageError{fmt.Sprintf("Invalid command: %s!", args[1])}
+			err = usageError{fmt.Sprintf("invalid command: %s", args[1])}
 		}
 	}
 
@@ -645,7 +645,7 @@ func run(args []string, a app) int {
 		}
 		var ue usageError
 		if errors.As(err, &ue) {
-			a.printf("Use \"%s help\" for help!\n", prog)
+			a.printf("Use \"%s help\" for help\n", prog)
 		}
 		return 1
 	}
