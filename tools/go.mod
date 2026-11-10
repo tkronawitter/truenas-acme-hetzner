@@ -1,5 +1,7 @@
 module github.com/tkronawitter/truenas-acme-hetzner/tools
 
+// Only the minimum this module needs. CI installs govulncheck with the Go
+// version from ../go.mod (setup-go go-version-file), which is never lower.
 go 1.26.0
 
 tool golang.org/x/vuln/cmd/govulncheck
