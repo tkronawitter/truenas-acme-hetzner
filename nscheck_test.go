@@ -283,9 +283,11 @@ func TestSetCheckStaysInsideTheCommandTimeout(t *testing.T) {
 	never := newFakeDNS(t, "", 0)
 	f.setNameservers(never.addr())
 	a, _, _ := f.app()
+	// The check ends about 400ms in, so the assertion below keeps 400ms of
+	// headroom for slow CI runners with -race.
 	a.timeout = 800 * time.Millisecond
 	a.ns.maxWait = 15 * time.Second
-	a.ns.margin = 200 * time.Millisecond
+	a.ns.margin = 400 * time.Millisecond
 
 	start := time.Now()
 	code, stdout, stderr := runSet(a)
@@ -454,13 +456,20 @@ func TestSetChecksTheSubzoneNameservers(t *testing.T) {
 	}
 }
 
-// A nameserver without a port is asked on port 53. The context is already
-// cancelled, so nothing goes out on the network.
-func TestLookupTXTDirectDefaultPort(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := lookupTXTDirect(ctx, "192.0.2.1", challengeName); err == nil {
-		t.Error("lookup with a cancelled context succeeded")
+// A nameserver without a port is asked on port 53; one with a port keeps it.
+func TestNameserverAddr(t *testing.T) {
+	tests := []struct{ server, want string }{
+		{"1.2.3.4", "1.2.3.4:53"},
+		{"ns.example", "ns.example:53"},
+		{"hydrogen.ns.hetzner.com.", "hydrogen.ns.hetzner.com.:53"},
+		{"127.0.0.1:5353", "127.0.0.1:5353"},
+		{"[::1]:53", "[::1]:53"},
+		{"::1", "[::1]:53"},
+	}
+	for _, tt := range tests {
+		if got := nameserverAddr(tt.server); got != tt.want {
+			t.Errorf("nameserverAddr(%q) = %q, want %q", tt.server, got, tt.want)
+		}
 	}
 }
 

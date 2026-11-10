@@ -109,7 +109,6 @@ func (f *fakeHetzner) app() (app, *bytes.Buffer, *bytes.Buffer) {
 		},
 		timeout:     10 * time.Second,
 		retryBudget: 10 * time.Second,
-		attempts:    retryAttempts,
 		retryDelay:  time.Millisecond,
 		ns: nsCheck{
 			lookup:       lookupTXTDirect,

@@ -55,10 +55,7 @@ func defaultNSCheck() nsCheck {
 // recursive resolver and its cache. server is a hostname or IP, port 53 unless
 // it carries one (tests use a local port).
 func lookupTXTDirect(ctx context.Context, server, name string) ([]string, error) {
-	addr := server
-	if _, _, err := net.SplitHostPort(server); err != nil {
-		addr = net.JoinHostPort(server, "53")
-	}
+	addr := nameserverAddr(server)
 	r := &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
@@ -67,6 +64,15 @@ func lookupTXTDirect(ctx context.Context, server, name string) ([]string, error)
 		},
 	}
 	return r.LookupTXT(ctx, name)
+}
+
+// nameserverAddr returns server as host:port, with port 53 unless server
+// already carries a port.
+func nameserverAddr(server string) string {
+	if _, _, err := net.SplitHostPort(server); err == nil {
+		return server
+	}
+	return net.JoinHostPort(server, "53")
 }
 
 // fqdn returns name with exactly one trailing dot.
