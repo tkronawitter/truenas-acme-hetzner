@@ -175,9 +175,9 @@ Exit code 0 means success, 1 means failure; TrueNAS only looks at the exit code.
 - **Several values per name work.** A certificate for `example.com` and `*.example.com` puts two values under `_acme-challenge.example.com`. Both are kept until each is removed. Removing the last value deletes the record set.
 - **Short TTL.** Record sets that tah creates get a TTL of 60 seconds (an existing record set keeps its TTL), so a retry soon after a failed validation is not answered with an old cached value.
 - **They retry temporary failures.** If Hetzner answers with a server error (5xx), a rate limit, a lock or conflict, or an "already exists" error, or if the connection fails, `set` and `unset` try again, up to 3 attempts within 40 seconds. Each retry prints `Attempt N of 3 failed, retrying in Xs: ...` to stderr. Authentication errors (401, 403), not found (404) and invalid input fail at once, because another try would not change the answer. `test` is not repeated.
-- **`set` checks the nameservers.** After the change, `set` asks every authoritative nameserver of the zone directly for the TXT value and waits at most 10 seconds for all of them to serve it, within the 50 seconds below. The check only warns: `set` never fails because of it, and `unset` does not check. It needs outbound UDP and TCP port 53 to the Hetzner nameservers; without it the check has nothing to report. It prints to stdout:
+- **`set` checks the nameservers.** After the change, `set` asks every authoritative nameserver of the zone directly for the TXT value and waits at most 30 seconds for all of them to serve it, within the 50 seconds below. If `set` needed its retries, the check gets less, about 9 seconds when the retries used their full 40 seconds. The check only warns: `set` never fails because of it, and `unset` does not check. It needs outbound UDP and TCP port 53 to the Hetzner nameservers; without it the check has nothing to report. It prints to stdout:
   - `Challenge served by N of M nameservers after Xs`: all reachable nameservers serve the value. N is lower than M when some nameservers could not be queried.
-  - `Warning: after Xs the challenge is still missing on <nameservers>; continuing, the TrueNAS propagation delay and the ACME validation decide`: the 10 seconds passed. `set` still exits 0.
+  - `Warning: after Xs the challenge is still missing on <nameservers>; continuing, the TrueNAS propagation delay and the ACME validation decide`: the wait ran out. `set` still exits 0.
   - `Warning: cannot query <nameserver>, checking the other nameservers only`: one or more nameservers did not answer; the others are checked.
   - `Warning: nameserver check skipped, cannot query <nameservers> (is outbound port 53 blocked?): <reason>`: no nameserver could be queried, so the check is skipped.
   - `Nameserver check skipped: not enough time left before the 50s timeout`: the retries used up the time.
@@ -236,7 +236,7 @@ In TrueNAS UI: **Credentials → Certificates → ACME DNS-Authenticators**
 **Propagation Delay.** Default 60 seconds, minimum 10. Keep the default until you have measured how long your zone takes.
 
 - TrueNAS waits this long after every `set`, once for each name in the certificate. A certificate for `example.com` and `*.example.com` therefore waits twice.
-- `set` returns when Hetzner reports the change as done. That does not mean every Hetzner nameserver serves the record yet; the delay covers that gap. `set` also checks the nameservers for up to 10 seconds (see [How `set` and `unset` behave](#how-set-and-unset-behave)), but that check only warns and does not replace the delay.
+- `set` returns when Hetzner reports the change as done. That does not mean every Hetzner nameserver serves the record yet; the delay covers that gap. `set` also checks the nameservers for up to 30 seconds (see [How `set` and `unset` behave](#how-set-and-unset-behave)), but that check only warns and does not replace the delay. In tests the slowest Hetzner nameserver served a new value 16 to 23 seconds after `set` started, so the default of 60 seconds leaves room.
 
 ## Building from Source
 
