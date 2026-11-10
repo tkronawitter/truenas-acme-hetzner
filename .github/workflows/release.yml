@@ -13,10 +13,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      # No job pushes, so the checkout token is not kept in .git/config.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The Go version comes from go.mod, so the release records the exact patch version.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26'
+          go-version-file: go.mod
       - run: go mod download
       - run: go mod verify
       - run: go test -v -race ./...
@@ -40,9 +44,14 @@ jobs:
       id-token: write  # Required for OIDC/Cosign keyless signing
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No cache: the signed binary is built from freshly downloaded modules, not
+      # from a cache that a CI run with third-party actions may have saved (#48).
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26'
+          go-version-file: go.mod
+          cache: false
       # No cosign-release input: the action's default cosign version is fixed by the
       # pinned SHA, so a Dependabot bump moves action and cosign together.
       # Composite action, so it is not affected by the Node.js 20 deprecation.
@@ -53,8 +62,9 @@ jobs:
         run: |
           mkdir -p release
           # Static binary: no dependency on the runner's glibc, which would otherwise
-          # set the minimum glibc the NAS needs
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -X main.Version=$VERSION" -o release/tah-linux-amd64 .
+          # set the minimum glibc the NAS needs. -trimpath and an empty build ID
+          # keep runner paths out, so a rebuild of the tag gives the same bytes.
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -buildid= -X main.Version=$VERSION" -o release/tah-linux-amd64 .
       # Sigstore bundle: signature, certificate and transparency log proof in one
       # file, verifiable offline.
       - name: Sign binary with Cosign (Sigstore bundle)
