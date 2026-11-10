@@ -43,12 +43,10 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26'
-      # Held at v3: cosign-installer v4 installs cosign v3, whose sign-blob ignores
-      # --output-signature/--output-certificate and fails without --bundle (#9).
+      # No cosign-release input: the action's default cosign version is fixed by the
+      # pinned SHA, so a Dependabot bump moves action and cosign together.
       # Composite action, so it is not affected by the Node.js 20 deprecation.
-      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
-        with:
-          cosign-release: 'v2.6.5'
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - name: Build binary
         env:
           VERSION: ${{ github.ref_name }}
@@ -57,9 +55,33 @@ jobs:
           # Static binary: no dependency on the runner's glibc, which would otherwise
           # set the minimum glibc the NAS needs
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -X main.Version=$VERSION" -o release/tah-linux-amd64 .
-      - name: Sign binary with Cosign
+      # Sigstore bundle: signature, certificate and transparency log proof in one
+      # file, verifiable offline.
+      - name: Sign binary with Cosign (Sigstore bundle)
         run: |
           cosign sign-blob --yes \
+            --bundle release/tah-linux-amd64.sigstore.json \
+            release/tah-linux-amd64
+          test -s release/tah-linux-amd64.sigstore.json
+      # A bundle that does not verify against this workflow's identity stops the
+      # release before anything is published.
+      - name: Verify bundle
+        env:
+          IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+        run: |
+          cosign verify-blob \
+            --bundle release/tah-linux-amd64.sigstore.json \
+            --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            release/tah-linux-amd64
+      # Transition (#9): detached .sig/.pem for existing verification scripts,
+      # published for one more release and dropped in the release after v1.3.0.
+      # cosign v3 writes them only with the legacy format and without the signing config.
+      - name: Sign binary with Cosign (detached, transition)
+        run: |
+          cosign sign-blob --yes \
+            --use-signing-config=false \
+            --new-bundle-format=false \
             --output-signature release/tah-linux-amd64.sig \
             --output-certificate release/tah-linux-amd64.pem \
             release/tah-linux-amd64
@@ -74,6 +96,7 @@ jobs:
         with:
           files: |
             release/tah-linux-amd64
+            release/tah-linux-amd64.sigstore.json
             release/tah-linux-amd64.sig
             release/tah-linux-amd64.pem
             release/checksums-sha256.txt
