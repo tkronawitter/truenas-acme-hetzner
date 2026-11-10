@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,8 +52,31 @@ func TestTestCommandPrintsModeWarning(t *testing.T) {
 	if code := run([]string{"tah", "test", "example.com"}, a); code != 0 {
 		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "Dangerous file mode: 644, use 0600!") {
-		t.Errorf("stdout = %q, want the mode warning", stdout.String())
+	if want := "Token file mode is 0644, should be 0600. Run: chmod 600 " + a.tokenPath; !strings.Contains(stdout.String(), want) {
+		t.Errorf("stdout = %q, want %q", stdout.String(), want)
+	}
+}
+
+// A token file of another user and group names both ids and the command
+// that fixes the owner. Changing the owner of a real file needs root, so the
+// comparison is tested on its own.
+func TestOwnerWarningsFor(t *testing.T) {
+	uid, gid := uint32(os.Geteuid()), uint32(os.Getegid())
+	if got := ownerWarningsFor("/x/.tahtoken", uid, gid, uid, gid); len(got) != 0 {
+		t.Errorf("warnings = %v, want none for a file of the running user", got)
+	}
+
+	got := ownerWarningsFor("/x/.tahtoken", uid+1, gid+1, uid, gid)
+	if len(got) != 2 {
+		t.Fatalf("warnings = %v, want one for the user and one for the group", got)
+	}
+	wantUser := fmt.Sprintf("Token file /x/.tahtoken belongs to uid %d, but tah runs as uid %d. Run: sudo chown ", uid+1, uid)
+	wantGroup := fmt.Sprintf("Token file /x/.tahtoken belongs to gid %d, but tah runs as gid %d. Run: sudo chgrp ", gid+1, gid)
+	if !strings.HasPrefix(got[0], wantUser) || !strings.HasSuffix(got[0], " /x/.tahtoken") {
+		t.Errorf("user warning = %q, want prefix %q", got[0], wantUser)
+	}
+	if !strings.HasPrefix(got[1], wantGroup) || !strings.HasSuffix(got[1], " /x/.tahtoken") {
+		t.Errorf("group warning = %q, want prefix %q", got[1], wantGroup)
 	}
 }
 
