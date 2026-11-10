@@ -13,6 +13,13 @@ import (
 // txtLookup asks one nameserver directly for the TXT values of name.
 type txtLookup func(ctx context.Context, server, name string) ([]string, error)
 
+// nsCheckMaxWait caps the nameserver check. Hetzner's slowest nameserver took
+// about 23s after the record was created on the NAS test of v1.3.0-rc1, so a
+// 10s cap warned on every issuance. The command deadline still limits the
+// check: set with its retries uses at most retryBudget, which leaves the check
+// at least apiTimeout-retryBudget.
+const nsCheckMaxWait = 30 * time.Second
+
 // nsCheck configures the wait in set until every authoritative nameserver
 // serves the challenge value. The check never fails a command: when it runs
 // out of time or cannot reach a nameserver, it warns and set still exits 0,
@@ -34,9 +41,8 @@ type nsCheck struct {
 func defaultNSCheck() nsCheck {
 	return nsCheck{
 		lookup: lookupTXTDirect,
-		// The 50s apiTimeout is split: 40s for set with its retries, the
-		// rest (10s) for this check.
-		maxWait: apiTimeout - retryBudget,
+		// At most 30s, and never past the 50s apiTimeout (see waitForNameservers).
+		maxWait: nsCheckMaxWait,
 		// tah's own 50s already stays 10s below the TrueNAS Script Timeout.
 		margin:       time.Second,
 		minWait:      2 * time.Second,

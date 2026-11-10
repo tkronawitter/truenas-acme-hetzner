@@ -464,14 +464,19 @@ func TestLookupTXTDirectDefaultPort(t *testing.T) {
 	}
 }
 
-// The production split of the 50s budget: retries first, the check gets the rest.
+// The production limits: the check waits up to 30s, and even after set used
+// its whole retry budget it still has more than minWait left before apiTimeout.
 func TestDefaultNSCheck(t *testing.T) {
 	c := defaultApp().ns
 	if c.lookup == nil {
 		t.Fatal("lookup is nil")
 	}
-	if c.maxWait != 10*time.Second || retryBudget+c.maxWait > apiTimeout {
-		t.Errorf("maxWait %s with retryBudget %s, want 10s and together at most apiTimeout %s", c.maxWait, retryBudget, apiTimeout)
+	if c.maxWait != 30*time.Second || c.maxWait >= apiTimeout {
+		t.Errorf("maxWait %s, want 30s and below apiTimeout %s", c.maxWait, apiTimeout)
+	}
+	if retryBudget+c.margin+c.minWait > apiTimeout {
+		t.Errorf("retryBudget %s + margin %s + minWait %s exceed apiTimeout %s: a slow set would skip the check",
+			retryBudget, c.margin, c.minWait, apiTimeout)
 	}
 	if c.minWait <= 0 || c.margin <= 0 || c.interval <= 0 || c.queryTimeout <= 0 || c.queryTimeout > c.maxWait {
 		t.Errorf("nsCheck %+v: want positive limits and a query timeout below maxWait", c)
