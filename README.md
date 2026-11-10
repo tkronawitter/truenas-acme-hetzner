@@ -51,6 +51,10 @@ This fork is a **drop-in replacement**: same CLI interface, same config file loc
 - Domain with DNS managed by Hetzner (migrated to Cloud Console)
 - Hetzner Cloud API token with Read & Write permission for the project that holds the zone
 - x86_64 (amd64) system; only a Linux amd64 binary is released
+- A TrueNAS user with a home directory to run tah as (not `nobody`, see [step 3](#3-choose-the-running-user-and-store-the-token))
+- Outbound HTTPS from the NAS to the Hetzner API
+- Outbound UDP and TCP port 53 to the Hetzner nameservers, only for the nameserver check of `set` (without it the check only warns)
+- cosign 3.x on any machine, only to [verify the download](#verify-the-download-optional)
 
 ## Installation
 
@@ -103,6 +107,12 @@ cosign verify-blob \
 
 Expected output: `Verified OK`. cosign 3.x prints a deprecation warning for `--signature` and `--certificate`; the check still works.
 
+**Check the file you install.** The check applies to the file you downloaded for it, not to the one `wget` fetched on the NAS. Either copy the verified `tah-linux-amd64` to the NAS as `/mnt/pool/tah`, or compare the checksum of both files. Run this on the verified machine and on the NAS (for the NAS file, `sha256sum /mnt/pool/tah`); the two values must be identical, and they must match the line for `tah-linux-amd64` in `checksums-sha256.txt` of the same release:
+
+```bash
+sha256sum tah-linux-amd64
+```
+
 ## Configuration
 
 ### 1. Migrate DNS Zone (if needed)
@@ -127,25 +137,31 @@ See [Hetzner docs on generating API tokens](https://docs.hetzner.com/cloud/api/g
 TrueNAS runs tah as the authenticator's "Running User" and sets `$HOME` to that user's home directory. tah reads the token from `$HOME/.tahtoken`. The default user `nobody` has no usable home directory, so the token file has nowhere to live: do not use it. Run the commands below as the user you will set as "Running User". The examples use `acme` as a placeholder for that user.
 
 1. Pick or create a user that has a home directory.
-2. Create the token file with mode 0600:
+2. Check that this user can read and execute the binary. It prints the version; `Permission denied` means the user cannot, so fix the permissions of the file and its folders first:
+
+```bash
+sudo -u acme -H /mnt/pool/tah version
+```
+
+3. Create the token file with mode 0600:
 
 ```bash
 sudo -u acme -H /mnt/pool/tah init
 ```
 
-3. Write the token into it:
+4. Write the token into it:
 
 ```bash
 sudo -u acme -H sh -c 'echo -n "YOUR_CLOUD_API_TOKEN" > $HOME/.tahtoken'
 ```
 
-4. Check the setup (creates and deletes a test TXT record in your zone):
+5. Check the setup (creates and deletes a test TXT record in your zone). See [Test Configuration](#test-configuration-recommended) for the output:
 
 ```bash
 sudo -u acme -H /mnt/pool/tah test nas.example.com
 ```
 
-The user must be able to read and execute the binary. If you switch to the user in some other way, make sure `$HOME` points to its home directory.
+If you switch to the user in some other way, make sure `$HOME` points to its home directory.
 
 **Note:** The file must contain only the token string. Spaces, tabs and line endings at the start and end are removed when the file is read, so an editor that adds a line feed or Windows line ending (CRLF) does no harm. An empty file stops with `token file <path> is empty, put your Hetzner Cloud API token in it`.
 
@@ -182,7 +198,7 @@ Exit code 0 means success, 1 means failure; TrueNAS only looks at the exit code.
   - `Warning: nameserver check skipped, cannot query <nameservers> (is outbound port 53 blocked?): <reason>`: no nameserver could be queried, so the check is skipped.
   - `Nameserver check skipped: not enough time left before the 50s timeout`: the retries used up the time.
   - `Nameserver check skipped: the zone lists no authoritative nameservers`: Hetzner returned no nameservers for the zone.
-- **Timeout.** `set` and `unset` give up after 50 seconds, including the wait for Hetzner, and exit 1 with `timed out after 50s`. See Script Timeout under [TrueNAS Integration](#truenas-integration).
+- **Timeout.** A `set` or `unset` that hangs stops when the 40 second retry budget is used up and exits 1. The message ends in `(gave up after 40s, attempts: N)`. 50 seconds is the hard upper limit for the whole command, including the wait for Hetzner and the nameserver check. A command that reaches it exits 1 with a message ending in `(timed out after 50s)`; `test`, which does not retry, ends this way when it hangs. See Script Timeout under [TrueNAS Integration](#truenas-integration).
 
 ### Which Zone Is Used
 
@@ -210,12 +226,19 @@ Run this as the Running User, after every change to the token or the user. It ne
 sudo -u acme -H /mnt/pool/tah test nas.example.com
 ```
 
-`test` looks for the zone of the domain you pass, then for its parent names, and reports what it found:
+`test` checks the token file, looks for the zone of the domain you pass (then for its parent names), creates a test TXT record and deletes it again. A passing run prints:
 
 ```
 Looking up zone for: nas.example.com
 Found zone: example.com
+Creating TXT record: hcdcadclk = "TEST-TRUENAS-ACME-HETZNER"
+Deleting test record...
+Test passed!
 ```
+
+`Test passed!` is the signal that everything worked; without that line the run failed, and the exit code is 1. If the token file has a problem (wrong mode or owner), `test` prints a warning about it before `Looking up zone`.
+
+`test` does not run the nameserver check. A blocked outbound port 53 therefore shows only during `set`, as a warning.
 
 ### Check Version
 ```bash
@@ -231,7 +254,7 @@ In TrueNAS UI: **Credentials → Certificates → ACME DNS-Authenticators**
 - Script Timeout: leave at the default of 60 seconds or higher
 - Propagation Delay: leave at the default of 60 seconds (see below)
 
-**Script Timeout.** Default 60 seconds, minimum 5. Keep at least 60. tah stops itself after 50 seconds and reports `timed out after 50s`, which is below the default, so the error comes from tah and is not a silent kill. A lower value in TrueNAS kills tah in the middle of a request, without a message. Raising the value in TrueNAS does not raise tah's own 50 second limit.
+**Script Timeout.** Default 60 seconds, minimum 5. Keep at least 60. tah stops itself before that: a hanging `set` or `unset` after 40 seconds (message ending in `gave up after 40s, attempts: N`), any command at the latest after 50 seconds (message ending in `timed out after 50s`). Both are below the default, so the error comes from tah and is not a silent kill. A lower value in TrueNAS kills tah in the middle of a request, without a message. Raising the value in TrueNAS does not raise tah's own 50 second limit.
 
 **Propagation Delay.** Default 60 seconds, minimum 10. Keep the default until you have measured how long your zone takes.
 
@@ -281,6 +304,8 @@ gh api -X PUT repos/tkronawitter/truenas-acme-hetzner/automated-security-fixes
 ```
 
 To switch them off again, send `-X DELETE` to the same URLs.
+
+**Rulesets.** Two rulesets protect the repository. *Main Branch Protection*: changes reach `main` only through a pull request, merged by squash, with the checks `build` and `security` passing and the branch up to date; `main` cannot be deleted or force-pushed. *Release Tag Protection*: tags matching `v*` can be created, but an existing one cannot be moved or deleted, so a published release always points to the commit it was built from.
 
 **Forks.** In a fork, Dependabot version updates are off until you switch them on under **Insights**, **Dependency graph**, **Dependabot**, with **Enable Dependabot**. This cannot be done through the API. Until then Dependabot does not run, even with a valid `.github/dependabot.yml`.
 
