@@ -40,9 +40,12 @@ jobs:
       id-token: write  # Required for OIDC/Cosign keyless signing
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # No cache: the signed binary is built from freshly downloaded modules, not
+      # from a cache that a CI run with third-party actions may have saved (#48).
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26'
+          cache: false
       # No cosign-release input: the action's default cosign version is fixed by the
       # pinned SHA, so a Dependabot bump moves action and cosign together.
       # Composite action, so it is not affected by the Node.js 20 deprecation.
