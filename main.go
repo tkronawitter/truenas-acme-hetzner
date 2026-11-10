@@ -29,8 +29,9 @@ const (
 	// below the default TrueNAS "Script Timeout" of 60s, so tah reports the
 	// timeout itself instead of being killed in the middle of a wait.
 	apiTimeout = 50 * time.Second
-	// retryBudget bounds set and unset including their retries. It leaves
-	// apiTimeout-retryBudget for the nameserver check planned in #21.
+	// retryBudget bounds set and unset including their retries. It guarantees
+	// the nameserver check after set at least apiTimeout-retryBudget; when set
+	// is faster, the check may use more, up to nsCheckMaxWait.
 	retryBudget = 40 * time.Second
 	// retryAttempts is how often set and unset run before tah gives up, and
 	// retryDelay the wait before the second run; it doubles after that.
