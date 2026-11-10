@@ -52,6 +52,9 @@ type fakeHetzner struct {
 	failActions  bool                          // polled actions finish with status error
 	lastCreate   schema.ZoneRRSetCreateRequest // body of the last create call
 	nameservers  map[string][]string           // zone name -> authoritative_nameservers.assigned
+	// requestTimeout, when set, replaces the production http.Client timeout,
+	// so a test can let a request time out quickly.
+	requestTimeout time.Duration
 }
 
 func newFakeHetzner(t *testing.T) *fakeHetzner {
@@ -94,11 +97,15 @@ func (f *fakeHetzner) app() (app, *bytes.Buffer, *bytes.Buffer) {
 		tokenPath: tokenPath,
 		newClient: func(token string) *hcloud.Client {
 			// The production options first, so the fake sees the real User-Agent
-			return hcloud.NewClient(append(clientOptions(token),
+			// and the production retry settings
+			opts := append(clientOptions(token),
 				hcloud.WithEndpoint(f.srv.URL),
-				hcloud.WithRetryOpts(hcloud.RetryOpts{MaxRetries: 0}),
 				hcloud.WithPollOpts(hcloud.PollOpts{BackoffFunc: hcloud.ConstantBackoff(time.Millisecond)}),
-			)...)
+			)
+			if f.requestTimeout > 0 {
+				opts = append(opts, hcloud.WithHTTPClient(&http.Client{Timeout: f.requestTimeout}))
+			}
+			return hcloud.NewClient(opts...)
 		},
 		timeout:     10 * time.Second,
 		retryBudget: 10 * time.Second,
@@ -133,6 +140,10 @@ const (
 	// dropAfter handles the request, then resets the connection instead of
 	// answering, as when a response is lost on the way back.
 	dropAfter
+	// timeoutAfter handles the request and finishes the actions it started,
+	// then sends nothing until the client's request timeout ends the request:
+	// the change is applied, but the answer never arrives.
+	timeoutAfter
 )
 
 // unfinished returns the IDs of actions no client has waited for.
@@ -145,6 +156,21 @@ func (f *fakeHetzner) unfinished() []int64 {
 	}
 	slices.Sort(ids)
 	return ids
+}
+
+// finishRunning lets every running action finish without a poll, as when
+// Hetzner completes a change whose answer the client never received. A
+// finished delete takes effect.
+func (f *fakeHetzner) finishRunning() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id, key := range f.running {
+		if f.deletes[id] {
+			delete(f.rrsets, key)
+			delete(f.deletes, id)
+		}
+		delete(f.running, id)
+	}
 }
 
 // locked reports whether an action on key is still running; the caller must hold f.mu.
@@ -277,6 +303,10 @@ func (f *fakeHetzner) middleware(next http.Handler) http.Handler {
 		case fail && fl.drop == dropAfter:
 			next.ServeHTTP(httptest.NewRecorder(), r)
 			f.reset(w)
+		case fail && fl.drop == timeoutAfter:
+			next.ServeHTTP(httptest.NewRecorder(), r)
+			f.finishRunning()
+			<-r.Context().Done()
 		case fail && fl.code == "":
 			http.Error(w, "injected failure", fl.status)
 		case fail:
