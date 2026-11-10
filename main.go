@@ -68,7 +68,6 @@ type app struct {
 	newClient   func(token string) *hcloud.Client
 	timeout     time.Duration
 	retryBudget time.Duration
-	attempts    int
 	retryDelay  time.Duration
 	ns          nsCheck
 }
@@ -303,11 +302,11 @@ func (a app) withRetry(ctx context.Context, op func(context.Context) error) erro
 			return giveUp(err, attempt)
 		case !retryable(err):
 			return err
-		case attempt == a.attempts:
+		case attempt == retryAttempts:
 			return fmt.Errorf("%w (after %d attempts)", err, attempt)
 		}
 
-		_, _ = fmt.Fprintf(a.stderr, "Attempt %d of %d failed, retrying in %s: %v\n", attempt, a.attempts, delay, err)
+		_, _ = fmt.Fprintf(a.stderr, "Attempt %d of %d failed, retrying in %s: %v\n", attempt, retryAttempts, delay, err)
 		select {
 		case <-retryCtx.Done():
 			return giveUp(err, attempt)
@@ -369,7 +368,7 @@ func deleteRRSetIfExists(ctx context.Context, client *hcloud.Client, zone *hclou
 // present" after a retry, for the nameserver check that run starts after the
 // retries.
 func (a app) cmdSet(ctx context.Context, args []string) ([]string, error) {
-	fqdn, candidates, value, err := recordArgs(args)
+	recordName, candidates, value, err := recordArgs(args)
 	if err != nil {
 		return nil, err
 	}
@@ -378,7 +377,7 @@ func (a app) cmdSet(ctx context.Context, args []string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	name := rrsetName(fqdn, zone)
+	name := rrsetName(recordName, zone)
 	a.printf("Zone %s, record %s\n", zone.Name, name)
 
 	if err := a.setRecord(ctx, client, zone, name, value); err != nil {
@@ -431,7 +430,7 @@ func (a app) setRecord(ctx context.Context, client *hcloud.Client, zone *hcloud.
 // A value or RRSet that is already gone counts as success, so a repeated
 // cleanup does not fail the TrueNAS job.
 func (a app) cmdUnset(ctx context.Context, args []string) error {
-	fqdn, candidates, value, err := recordArgs(args)
+	recordName, candidates, value, err := recordArgs(args)
 	if err != nil {
 		return err
 	}
@@ -440,7 +439,7 @@ func (a app) cmdUnset(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	name := rrsetName(fqdn, zone)
+	name := rrsetName(recordName, zone)
 	a.printf("Zone %s, record %s\n", zone.Name, name)
 
 	rrset, _, err := client.Zone.GetRRSetByNameAndType(ctx, zone, name, hcloud.ZoneRRSetTypeTXT)
@@ -642,7 +641,6 @@ func defaultApp() app {
 		newClient:   newClient,
 		timeout:     apiTimeout,
 		retryBudget: retryBudget,
-		attempts:    retryAttempts,
 		retryDelay:  retryDelay,
 		ns:          defaultNSCheck(),
 	}

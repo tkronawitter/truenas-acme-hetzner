@@ -1091,9 +1091,9 @@ func TestDefaultApp(t *testing.T) {
 	if a.newClient == nil {
 		t.Error("newClient is nil")
 	}
-	if a.timeout != apiTimeout || a.retryBudget != retryBudget || a.attempts != retryAttempts || a.retryDelay != retryDelay {
-		t.Errorf("timeout %s, retryBudget %s, attempts %d, retryDelay %s, want %s, %s, %d, %s",
-			a.timeout, a.retryBudget, a.attempts, a.retryDelay, apiTimeout, retryBudget, retryAttempts, retryDelay)
+	if a.timeout != apiTimeout || a.retryBudget != retryBudget || a.retryDelay != retryDelay {
+		t.Errorf("timeout %s, retryBudget %s, retryDelay %s, want %s, %s, %s",
+			a.timeout, a.retryBudget, a.retryDelay, apiTimeout, retryBudget, retryDelay)
 	}
 }
 
