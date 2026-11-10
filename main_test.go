@@ -72,7 +72,12 @@ func TestHelp(t *testing.T) {
 	if code != 0 || stderr != "" {
 		t.Fatalf("exit code = %d, stderr = %q", code, stderr)
 	}
-	for _, want := range []string{"Usage: tah <command>", "\tset\n", "\tunset\n", "\tinit", "\ttest", "\tversion", "\thelp"} {
+	for _, want := range []string{
+		"\ttah set|unset <domain> <validation_name> <validation_context>",
+		"\ttah test <domain>",
+		"\ttah init | version | --version | help",
+		"\tset ", "\tunset ", "\tinit ", "\ttest ", "\tversion, --version ", "\thelp ",
+	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("help output missing %q:\n%s", want, stdout)
 		}
@@ -469,8 +474,40 @@ func TestMissingToken(t *testing.T) {
 			if code := run(append([]string{"tah"}, tt.args...), a); code != 1 {
 				t.Errorf("exit code = %d, want 1", code)
 			}
-			if !strings.Contains(stderr.String(), tt.wantErr) {
-				t.Errorf("stderr = %q, want %q", stderr.String(), tt.wantErr)
+			hint := "token file " + a.tokenPath + ` not found. Run "tah init" as the Running User, then put the token into it`
+			if !strings.Contains(stderr.String(), tt.wantErr) || !strings.Contains(stderr.String(), hint) {
+				t.Errorf("stderr = %q, want %q and %q", stderr.String(), tt.wantErr, hint)
+			}
+			if f.rrsetCount() != 0 || f.called("GET /zones/example.com") {
+				t.Error("a missing token file must stop before any API call")
+			}
+		})
+	}
+}
+
+// A rejected token gets the hint about the token type, whichever call it
+// fails on; other API errors do not.
+func TestTokenRejectedHint(t *testing.T) {
+	tests := []struct {
+		name     string
+		call     string
+		fail     failure
+		wantHint bool
+	}{
+		{"401 on zone lookup", "GET /zones/example.com", failure{status: 401, code: "unauthorized"}, true},
+		{"403 on create", "POST /zones/42/rrsets", failure{status: 403, code: "forbidden"}, true},
+		{"422 on create", "POST /zones/42/rrsets", failure{status: 422, code: "invalid_input"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakeHetzner(t)
+			f.failWith(tt.call, tt.fail)
+			code, _, stderr := runCmd(f, "set", "example.com", "_acme-challenge.example.com", "x")
+			if code != 1 {
+				t.Errorf("exit code = %d, want 1", code)
+			}
+			if got := strings.Contains(stderr, tokenRejectedHint); got != tt.wantHint {
+				t.Errorf("stderr = %q, want the token hint: %v", stderr, tt.wantHint)
 			}
 		})
 	}

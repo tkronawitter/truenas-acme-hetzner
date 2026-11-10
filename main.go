@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -47,16 +48,24 @@ const (
 	testRecordText = "TEST-TRUENAS-ACME-HETZNER"
 )
 
-const helpText = `Usage: %s <command> <domain> <validation_name> <validation_context>
+const helpText = `Usage:
+	%[1]s set|unset <domain> <validation_name> <validation_context>   # called by TrueNAS
+	%[1]s test <domain>                                                # run by you
+	%[1]s init | version | --version | help
 
-Command:
-	set
-	unset
-	init - Initialize script
-	test - Test script configuration
-	version, --version - Print version
-	help - Print help
+Commands:
+	set                 Add the ACME challenge TXT record (called by TrueNAS)
+	unset               Remove the ACME challenge TXT record (called by TrueNAS)
+	init                Create $HOME/.tahtoken with mode 0600
+	test                Check the token file and create and delete a test TXT record
+	version, --version  Print the version
+	help                Print help
 `
+
+// tokenRejectedHint follows an unauthorized or forbidden answer: an old DNS
+// Console token fails on the first zone lookup and otherwise looks like a
+// problem with the zone.
+const tokenRejectedHint = "Hetzner rejected the token. Use a Hetzner Cloud API token with Read & Write; a DNS Console token does not work."
 
 // app holds everything a command touches outside its arguments, so tests can
 // swap the output streams, the token file, the Hetzner API endpoint, the
@@ -202,7 +211,7 @@ func recordValues(rrset *hcloud.ZoneRRSet) []string {
 func readToken(path string) (string, error) {
 	out, err := os.ReadFile(path)
 	if err != nil {
-		return "", err
+		return "", tokenFileError(path, err)
 	}
 	token := strings.TrimSpace(string(out))
 	if token == "" {
@@ -211,16 +220,25 @@ func readToken(path string) (string, error) {
 	return token, nil
 }
 
+// tokenFileError names the next step for a token file that does not exist,
+// the usual state before setup; other errors pass through.
+func tokenFileError(path string, err error) error {
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("token file %s not found. Run \"tah init\" as the Running User, then put the token into it", path)
+	}
+	return err
+}
+
 // checkTokenFile returns warnings about the ownership and mode of the token file.
 func checkTokenFile(path string) ([]string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return nil, err
+		return nil, tokenFileError(path, err)
 	}
 
-	warnings := ownerWarnings(info)
+	warnings := ownerWarnings(path, info)
 	if info.Mode() != 0o600 {
-		warnings = append(warnings, fmt.Sprintf("Dangerous file mode: %o, use 0600!", info.Mode()))
+		warnings = append(warnings, fmt.Sprintf("Token file mode is %04o, should be 0600. Run: chmod 600 %s", info.Mode().Perm(), path))
 	}
 	return warnings, nil
 }
@@ -622,6 +640,9 @@ func run(args []string, a app) int {
 			err = fmt.Errorf("%w (timed out after %s)", err, a.timeout)
 		}
 		_, _ = fmt.Fprintln(a.stderr, err)
+		if hcloud.IsError(err, hcloud.ErrorCodeUnauthorized, hcloud.ErrorCodeForbidden) {
+			_, _ = fmt.Fprintln(a.stderr, tokenRejectedHint)
+		}
 		var ue usageError
 		if errors.As(err, &ue) {
 			a.printf("Use \"%s help\" for help!\n", prog)
