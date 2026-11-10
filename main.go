@@ -210,24 +210,18 @@ func checkTokenFile(path string) ([]string, error) {
 // puts "truenas-acme-hetzner/<Version>" in front of the hcloud-go User-Agent,
 // so Hetzner can tell this tool apart from other hcloud-go clients.
 //
-// hcloud-go retries 502, 504, network timeouts and a few API error codes on
-// its own, by default 5 times with up to 60s backoff. That alone could use up
-// apiTimeout, and it would multiply with the command retries in withRetry, so
-// it is cut down to 2 quick retries per request.
+// hcloud-go's own retries are switched off, so withRetry is the only retry
+// layer. hcloud-go resends a request after a network timeout whatever its
+// method, so a DELETE or add/remove that was applied but whose answer timed out
+// would be sent again blind: a second DELETE gets 404 and fails unset after the
+// record is gone, a second add_records stores the value twice (#50). withRetry
+// reads the record set again before each attempt and finds the change in place.
 func clientOptions(token string) []hcloud.ClientOption {
 	return []hcloud.ClientOption{
 		hcloud.WithToken(token),
 		hcloud.WithApplication("truenas-acme-hetzner", Version),
 		hcloud.WithHTTPClient(&http.Client{Timeout: requestTimeout}),
-		hcloud.WithRetryOpts(hcloud.RetryOpts{
-			MaxRetries: 2,
-			BackoffFunc: hcloud.ExponentialBackoffWithOpts(hcloud.ExponentialBackoffOpts{
-				Base:       500 * time.Millisecond,
-				Multiplier: 2,
-				Cap:        2 * time.Second,
-				Jitter:     true,
-			}),
-		}),
+		hcloud.WithRetryOpts(hcloud.RetryOpts{MaxRetries: 0}),
 	}
 }
 

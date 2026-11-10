@@ -903,6 +903,56 @@ func TestRetryTransientFailures(t *testing.T) {
 	}
 }
 
+// A change that Hetzner applied but whose answer timed out is sent exactly
+// once: the retry reads the record set again and finds the change in place,
+// instead of resending the request blind (#50). A blind resend fails unset
+// with 404 after the delete or stores an added value twice.
+func TestAppliedChangeWithTimedOutAnswerIsNotResent(t *testing.T) {
+	const rrset = "/zones/42/rrsets/_acme-challenge/TXT"
+	tests := []struct {
+		name     string
+		existing []string
+		cmd      string
+		call     string
+		want     []string // records afterwards; nil means the RRSet is gone
+	}{
+		{"create", nil, "set", "POST /zones/42/rrsets", []string{`"x"`}},
+		{"add", []string{`"other"`}, "set", "POST " + rrset + "/actions/add_records", []string{`"other"`, `"x"`}},
+		{"remove", []string{`"x"`, `"other"`}, "unset", "POST " + rrset + "/actions/remove_records", []string{`"other"`}},
+		{"delete", []string{`"x"`}, "unset", "DELETE " + rrset, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakeHetzner(t)
+			f.requestTimeout = 100 * time.Millisecond
+			if tt.existing != nil {
+				f.addRecords("_acme-challenge", tt.existing...)
+			}
+			f.failWith(tt.call, failure{n: 1, drop: timeoutAfter})
+
+			code, _, stderr := runCmd(f, tt.cmd, "example.com", "_acme-challenge.example.com", "x")
+			if code != 0 {
+				t.Fatalf("exit code = %d, stderr = %q, want 0", code, stderr)
+			}
+			if n := f.count(tt.call); n != 1 {
+				t.Errorf("%s was sent %d times, want 1", tt.call, n)
+			}
+			if !strings.Contains(stderr, "Attempt 1 of 3 failed") {
+				t.Errorf("stderr = %q, want the timed out first attempt", stderr)
+			}
+			got, ok := f.records("_acme-challenge")
+			if tt.want == nil && ok {
+				t.Errorf("RRSet still exists with %v", got)
+			}
+			if tt.want != nil && !slices.Equal(got, tt.want) {
+				t.Errorf("records = %v, want %v", got, tt.want)
+			}
+			assertAllWaited(t, f)
+		})
+	}
+}
+
 // Authentication, not found and validation errors are final.
 func TestNotRetried(t *testing.T) {
 	const rrset = "/zones/42/rrsets/_acme-challenge/TXT"
